@@ -11,9 +11,6 @@ Exposes:
 
     - TRANSFORMER_AVAILABLE: bool
     - predict_transformer_from_df(df_project, project_id) -> Optional[Dict[str, float]]
-
-This version is very verbose in its logging so that we can see what is
-happening in Railway logs.
 """
 
 from __future__ import annotations
@@ -176,6 +173,9 @@ def _build_timeseries_for_project(df_project: pd.DataFrame, project_id: str) -> 
         df["payment_amount_num"] = df.get("payment_amount", np.nan).apply(parse_money)
     if "project_value_num" not in df.columns:
         df["project_value_num"] = df.get("project_value", np.nan).apply(parse_money)
+
+    # 🔑 CRITICAL FIX: overwrite string 'payment_amount' with numeric version
+    df["payment_amount"] = df["payment_amount_num"]  # <<< NEW
 
     # Parse dates
     df["payment_date_parsed"] = pd.to_datetime(
