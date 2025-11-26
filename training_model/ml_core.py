@@ -1,3 +1,17 @@
+"""
+ml_core for IPEX Oracle.
+
+This module is called by the FastAPI app to:
+- Load ML models (XGBoost tabular models, SHAP explainers, optional Transformer).
+- Turn one project's raw transaction dataframe into model-ready features.
+- Run predictions and return a JSON-ready risk summary.
+
+Design goals:
+- Safe in cloud environments (Railway) even if some model files are missing.
+- Backwards compatible with the API response shape you've already wired up.
+- Easy to plug in your PyTorch Transformer via transformer_head.predict_project.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import os
 
 # Optional deps – code still imports if some are missing.
 try:
@@ -131,7 +146,7 @@ def _load_models_once() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Feature engineering for XGBoost (based on training_projects_train.csv)
+# Helpers – cleaning & feature engineering
 # ---------------------------------------------------------------------------
 
 _FEATURE_COLUMNS = [
@@ -145,6 +160,20 @@ _FEATURE_COLUMNS = [
 ]
 
 
+def _to_numeric_series(series: pd.Series) -> pd.Series:
+    """
+    Convert a Series with values like '$1,234.56' or '-$500'
+    into clean float numbers. Invalid values -> 0.0.
+    """
+    s = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+    return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)
+
+
 def _safe_get_first(df: pd.DataFrame, cols: List[str]) -> float:
     """Return first non-null value from the first existing column; else 0."""
     for col in cols:
@@ -154,6 +183,7 @@ def _safe_get_first(df: pd.DataFrame, cols: List[str]) -> float:
                 if pd.notna(val):
                     return float(val)
             except Exception:
+                # might be a string date or weird format
                 continue
     return 0.0
 
@@ -187,16 +217,22 @@ def _build_features_from_raw(df_project: pd.DataFrame) -> pd.DataFrame:
             planned_duration_days = 0.0
     else:
         planned_duration_days = 0.0
-        start_val = _safe_get_first(
-            df,
-            ["project_contract_start_date", "contract_start_date", "start_date"],
-        )
-        end_val = _safe_get_first(
-            df,
-            ["project_completion_date", "planned_completion_date", "end_date"],
-        )
+        # Try to derive from dates
+        start_val = None
+        end_val = None
+
+        for col in ["project_contract_start_date", "contract_start_date", "start_date"]:
+            if col in df.columns and len(df[col]) > 0:
+                start_val = df[col].iloc[0]
+                break
+
+        for col in ["project_completion_date", "planned_completion_date", "end_date"]:
+            if col in df.columns and len(df[col]) > 0:
+                end_val = df[col].iloc[0]
+                break
+
         try:
-            if start_val and end_val:
+            if start_val is not None and end_val is not None:
                 start_dt = pd.to_datetime(start_val)
                 end_dt = pd.to_datetime(end_val)
                 planned_duration_days = float((end_dt - start_dt).days)
@@ -214,7 +250,7 @@ def _build_features_from_raw(df_project: pd.DataFrame) -> pd.DataFrame:
             break
 
     if payment_col is not None and len(df) > 0:
-        payments = df[payment_col].fillna(0.0)
+        payments = _to_numeric_series(df[payment_col])
         avg_payment_amount = float(payments.mean())
         total_paid = float(payments.sum())
     else:
@@ -229,7 +265,10 @@ def _build_features_from_raw(df_project: pd.DataFrame) -> pd.DataFrame:
             break
 
     if trade_col is not None and payment_col is not None:
-        grouped = df.groupby(trade_col)[payment_col].sum()
+        df_pay = df.copy()
+        df_pay[payment_col] = _to_numeric_series(df_pay[payment_col])
+
+        grouped = df_pay.groupby(trade_col)[payment_col].sum()
         num_trades = float(grouped.shape[0])
         if grouped.shape[0] > 0:
             max_trade_paid = float(grouped.max())
@@ -270,15 +309,19 @@ def _run_xgboost_models(
         weeks_pred, cost_pred, shap_info
     """
     _load_models_once()
-    X = _build_features_from_raw(df_project)
-
-    weeks_pred = 0.0
-    cost_pred = 0.0
-
     shap_info: Dict[str, List[Dict[str, float]]] = {
         "weeks_late": [],
         "cost_overrun_percent": [],
     }
+
+    # If models are missing, just return zeros
+    if _model_weeks is None and _model_cost is None:
+        return 0.0, 0.0, shap_info
+
+    X = _build_features_from_raw(df_project)
+
+    weeks_pred = 0.0
+    cost_pred = 0.0
 
     # weeks model
     if _model_weeks is not None:
@@ -370,6 +413,7 @@ def _run_transformer(
 def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
     """
     Main entry point: one project's raw dataframe in, JSON-style dict out.
+    This function MUST NOT raise – any internal error falls back to zeros.
     """
 
     # project_id
@@ -382,17 +426,40 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
     attrs = getattr(df_project, "attrs", {}) or {}
     source_id = str(attrs.get("source_id", f"{project_id}.csv"))
 
+    # Defaults in case anything fails
+    xgb_weeks = 0.0
+    xgb_cost = 0.0
+    shap_info: Dict[str, List[Dict[str, float]]] = {
+        "weeks_late": [],
+        "cost_overrun_percent": [],
+    }
+    transformer_weeks: Optional[float] = None
+    transformer_cost: Optional[float] = None
+
     # ---- XGB + SHAP --------------------------------------------------------
-    xgb_weeks, xgb_cost, shap_info = _run_xgboost_models(df_project)
+    try:
+        xgb_weeks, xgb_cost, shap_info = _run_xgboost_models(df_project)
+    except Exception as exc:  # pragma: no cover
+        print(f"[ml_core] ERROR during XGBoost pipeline: {exc}")
+        xgb_weeks = 0.0
+        xgb_cost = 0.0
+        shap_info = {
+            "weeks_late": [],
+            "cost_overrun_percent": [],
+        }
 
     # ---- Transformer -------------------------------------------------------
-    transformer_weeks, transformer_cost = _run_transformer(df_project)
+    try:
+        transformer_weeks, transformer_cost = _run_transformer(df_project)
+    except Exception as exc:  # pragma: no cover
+        print(f"[ml_core] ERROR during Transformer pipeline: {exc}")
+        transformer_weeks, transformer_cost = None, None
 
     # ---- Blended = same as before (just XGB for now) ----------------------
     blended_weeks = xgb_weeks
     blended_cost = xgb_cost
 
-    # ---- Simple explanation logic (same as before style) -------------------
+    # ---- Simple explanation logic (same style as before) -------------------
     if blended_weeks > 8 or blended_cost > 10:
         explanation_text = (
             "The project is forecast to finish significantly late and/or over budget "
@@ -421,6 +488,11 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
             "but no major risk intervention is recommended at this stage."
         ]
 
+    llm_used = False
+    llm_error = ""
+    if "OPENAI_API_KEY" not in os.environ:
+        llm_error = "OPENAI_API_KEY environment variable is not set."
+
     return {
         "project_id": project_id,
         "predictions": {
@@ -443,8 +515,8 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
         "trade_risks": [],
         "explanation_text": explanation_text,
         "recommended_actions": recommended_actions,
-        "llm_used": False,
-        "llm_error": "OPENAI_API_KEY environment variable is not set.",
+        "llm_used": llm_used,
+        "llm_error": llm_error,
         "source_id": source_id,
     }
 
