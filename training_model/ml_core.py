@@ -1,43 +1,41 @@
 """
-Full ML core for IPEX Oracle.
+ml_core.py
 
-- Uses XGBoost models for weeks-late and cost-overrun predictions.
-- Uses SHAP explainers for feature attributions (when available).
-- Is robust to:
-    * missing feature columns
-    * non-numeric values in feature columns
-    * missing model / explainer files in the deployed environment
+Production ML core for IPEX Oracle.
 
-Public API (used by FastAPI app):
+- Loads XGBoost delay & cost models (and SHAP explainers) from .pkl files.
+- Aligns incoming features to the model's expected feature set.
+- Avoids XGBoost "feature_names mismatch" errors by passing NumPy arrays.
+- Gracefully degrades to zeros if any artefacts are missing.
 
-    make_risk_summary_from_df(df_project) -> dict
-    batch_predict(df_all) -> list[dict]
+Transformer / GNN models are optional and currently return None so the
+API fields appear as `null` in JSON. You can wire these in later.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
 import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import joblib
 import numpy as np
 import pandas as pd
 
-# Optional dependencies (SHAP / torch etc.) – imported lazily where needed
-try:
-    import shap  # type: ignore
-except Exception:  # pragma: no cover
-    shap = None  # type: ignore
-
 logger = logging.getLogger("ml_core")
 if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
-
+    # Basic console logging; Railway will capture stdout.
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "[ml_core] %(levelname)s: %(message)s"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
-# Paths to model artefacts
+# Paths to artefacts
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,321 +46,383 @@ MODEL_COST_PATH = BASE_DIR / "model_overrun_percent.pkl"
 EXPLAINER_DELAY_PATH = BASE_DIR / "explainer_weeks_late.pkl"
 EXPLAINER_COST_PATH = BASE_DIR / "explainer_overrun_percent.pkl"
 
-# (Transformer artefacts – wired later if needed)
+# Optional transformer artefacts (only used if you later wire them in)
 TRANSFORMER_MODEL_PATH = BASE_DIR / "transformer_model.pt"
 TRANSFORMER_NORM_STATS_PATH = BASE_DIR / "transformer_norm_stats.npz"
 
-
 # ---------------------------------------------------------------------------
-# Feature lists used when the XGBoost models were trained
-# (must match training_projects_train.csv / training code)
+# Safe loading helpers
 # ---------------------------------------------------------------------------
 
-XGB_DELAY_FEATURES: List[str] = [
-    "project_value_num2",
-    "project_duration_days2",
-    "project_day",
-    "pct_time_elapsed",
-    "payment_amount_num",
-    "cum_project_paid",
-    "pct_project_paid",
-    "trade_value_share",
-    "is_large_trade",
-    "days_since_last_trade_payment",
-    "trade_duration_days",
-    "pct_trade_time_elapsed",
-    "pct_trade_paid",
-    "trade_schedule_lag",
-    "planned_cost",
-    "planned_duration_days",
-    "num_payments",
-    "avg_payment_amount",
-    "num_trades",
-    "max_trade_paid",
-    "trade_cost_concentration",
-]
 
-# For now cost model uses the same feature set; if you trained with a
-# slightly different set, edit this list accordingly.
-XGB_COST_FEATURES: List[str] = list(XGB_DELAY_FEATURES)
-
-
-# ---------------------------------------------------------------------------
-# Load models and explainers (with safety)
-# ---------------------------------------------------------------------------
-
-def _safe_load(path: Path, description: str) -> Any:
+def _load_joblib(path: Path, name: str) -> Optional[Any]:
     if not path.exists():
-        logger.warning("[ml_core] %s file missing: %s", description, path)
+        logger.warning("%s not found at %s – using fallback behaviour.", name, path)
         return None
     try:
         obj = joblib.load(path)
-        logger.info("[ml_core] Loaded %s from %s", description, path.name)
+        logger.info("Loaded %s from %s", name, path.name)
         return obj
-    except Exception as exc:  # pragma: no cover
-        logger.exception("[ml_core] Failed to load %s from %s: %s", description, path, exc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to load %s from %s: %s", name, path, exc)
         return None
 
 
-model_weeks = _safe_load(MODEL_DELAY_PATH, "XGB weeks-late model")
-model_cost = _safe_load(MODEL_COST_PATH, "XGB cost-overrun model")
+def _get_feature_names_from_model(model: Any) -> List[str]:
+    """
+    Try hard to discover the feature name list used when the XGBoost model
+    was trained. Different xgboost versions store this differently.
+    """
+    if model is None:
+        return []
 
-explainer_weeks = _safe_load(EXPLAINER_DELAY_PATH, "SHAP weeks-late explainer") if shap else None
-explainer_cost = _safe_load(EXPLAINER_COST_PATH, "SHAP cost-overrun explainer") if shap else None
+    # 1) Newer xgboost: model.feature_names_in_
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None and len(names):
+        return [str(c) for c in list(names)]
+
+    # 2) Access booster.feature_names
+    booster = getattr(model, "get_booster", None)
+    if booster is not None:
+        try:
+            bst = booster()
+            if hasattr(bst, "feature_names") and bst.feature_names:
+                return [str(c) for c in list(bst.feature_names)]
+        except Exception:
+            pass  # fall through
+
+    return []
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Load models / explainers at import time
 # ---------------------------------------------------------------------------
 
-def _ensure_numeric_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+model_weeks = _load_joblib(MODEL_DELAY_PATH, "delay model")
+model_cost = _load_joblib(MODEL_COST_PATH, "cost model")
+
+explainer_weeks = _load_joblib(EXPLAINER_DELAY_PATH, "delay SHAP explainer")
+explainer_cost = _load_joblib(EXPLAINER_COST_PATH, "cost SHAP explainer")
+
+DELAY_FEATURES: List[str] = _get_feature_names_from_model(model_weeks)
+COST_FEATURES: List[str] = _get_feature_names_from_model(model_cost)
+
+if DELAY_FEATURES:
+    logger.info("Delay model expects %d features.", len(DELAY_FEATURES))
+if COST_FEATURES:
+    logger.info("Cost model expects %d features.", len(COST_FEATURES))
+
+# Optional: lazy-loaded transformer model (if you wire it in later)
+_transformer_model: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Feature preparation and alignment
+# ---------------------------------------------------------------------------
+
+
+def _numericise_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Coerce the specified columns to numeric, with errors -> NaN -> 0.0.
-    This avoids "Could not convert string '...$104.70-...'" errors.
+    Convert all columns to numeric where possible.
+
+    - For numeric dtypes we keep as-is.
+    - For object/string columns we strip non-numeric characters (to cope with
+      '$', commas, etc.) and coerce to float. Non-convertible values become NaN.
     """
-    df = df.copy()
-    for col in cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Only fillna on columns that actually exist
-    existing = [c for c in cols if c in df.columns]
-    if existing:
-        df[existing] = df[existing].fillna(0.0)
-    return df
+    out = pd.DataFrame(index=df.index)
+
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            out[col] = s.astype(float)
+        else:
+            # Convert things like "$1,234.56" or "-$6,557.18" to numbers
+            cleaned = (
+                s.astype(str)
+                .str.replace(r"[^0-9eE+\-\.]", "", regex=True)
+                .replace({"": np.nan})
+            )
+            out[col] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Replace remaining NaNs with 0 – the models were trained on numeric data
+    out = out.fillna(0.0)
+    return out
 
 
-def _build_feature_matrix(
-    df_project: pd.DataFrame, feature_names: List[str], label: str
-) -> Tuple[pd.DataFrame, List[str]]:
+def _align_features_for_model(
+    df_numeric: pd.DataFrame,
+    expected_cols: List[str],
+    model_label: str,
+) -> pd.DataFrame:
     """
-    Return a DataFrame X with *exactly* the columns in feature_names:
-    - any missing columns are added and filled with 0.0
-    - all columns are coerced to numeric
-    - column order is fixed
+    Aligns the numeric dataframe to the model's expected feature set.
 
-    Returns (X, missing_features).
+    - Missing features are added and filled with 0.
+    - Extra features are dropped.
+    - Returns a dataframe with columns in the exact expected order.
     """
-    df = df_project.copy()
+    if not expected_cols:
+        # If we don't know the feature names, just pass everything through.
+        logger.warning(
+            "%s has no recorded feature_names; using all numeric columns: %s",
+            model_label,
+            list(df_numeric.columns),
+        )
+        return df_numeric.copy()
 
-    # Coerce any existing feature columns to numeric
-    df = _ensure_numeric_columns(df, feature_names)
+    missing = [c for c in expected_cols if c not in df_numeric.columns]
+    extra = [c for c in df_numeric.columns if c not in expected_cols]
 
-    missing = [c for c in feature_names if c not in df.columns]
     if missing:
         logger.warning(
-            "[ml_core] %s model: input missing %d feature(s): %s – filling with 0.0",
-            label,
+            "%s: input missing %d feature(s): %s – filling with 0.0",
+            model_label,
             len(missing),
             ", ".join(missing),
         )
-        for col in missing:
-            df[col] = 0.0
+    if extra:
+        logger.info(
+            "%s: input has %d extra feature(s) that will be ignored: %s",
+            model_label,
+            len(extra),
+            ", ".join(extra[:25]) + ("..." if len(extra) > 25 else ""),
+        )
 
-    # Ensure correct order and only the expected columns
-    X = df.reindex(columns=feature_names)
-    return X, missing
+    df_aligned = df_numeric.reindex(columns=expected_cols, fill_value=0.0)
+    return df_aligned
+
+
+# ---------------------------------------------------------------------------
+# Core prediction helpers
+# ---------------------------------------------------------------------------
 
 
 def _predict_with_xgb(
     model: Any,
-    explainer: Any,
-    df_project: pd.DataFrame,
-    feature_names: List[str],
+    df_numeric: pd.DataFrame,
+    expected_cols: List[str],
     label: str,
-) -> Tuple[float, List[float]]:
+) -> float:
     """
-    Run an XGBoost model + SHAP (if available) on a single-project DataFrame.
+    Predict using an XGBoost model, with robust handling of feature name
+    mismatches.
 
-    Returns (prediction, shap_values_list).
-    If anything fails, returns (0.0, []) and logs a warning.
+    We **always** pass a NumPy array into model.predict(), which avoids
+    xgboost's feature_names consistency checks.
     """
     if model is None:
-        logger.warning("[ml_core] %s model not loaded – returning 0.0", label)
-        return 0.0, []
+        return 0.0
 
     try:
-        X, _ = _build_feature_matrix(df_project, feature_names, label)
-        # XGBoost returns np.ndarray; we expect a single-row prediction
-        y_pred = float(model.predict(X)[0])
-
-        shap_vals: List[float] = []
-        if explainer is not None and shap is not None:
-            try:
-                # Some explainers return (n_samples, n_features)
-                sv = explainer.shap_values(X)
-                # Ensure we handle both list-of-arrays and single array forms
-                if isinstance(sv, list):
-                    sv_arr = np.array(sv[0])
-                else:
-                    sv_arr = np.array(sv)
-                shap_vals = sv_arr[0].astype(float).tolist()
-            except Exception as exc:  # pragma: no cover
-                logger.warning("[ml_core] %s SHAP failed: %s", label, exc)
-
-        return y_pred, shap_vals
-
-    except Exception as exc:  # pragma: no cover
-        logger.warning("[ml_core] %s model predict failed: %s", label, exc)
-        return 0.0, []
+        X = _align_features_for_model(df_numeric, expected_cols, f"{label} model")
+        # IMPORTANT: use .values so xgboost does not try to match column names
+        y_pred = model.predict(X.values)
+        if isinstance(y_pred, (list, np.ndarray, pd.Series)):
+            return float(y_pred[0])
+        return float(y_pred)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("%s model predict failed: %s", label, exc)
+        return 0.0
 
 
-def _build_explanation(
-    weeks_late: float,
-    cost_overrun_pct: float,
-) -> Tuple[str, List[str]]:
+def _compute_shap_values(
+    explainer: Any,
+    df_numeric: pd.DataFrame,
+    expected_cols: List[str],
+    label: str,
+) -> List[float]:
     """
-    Very simple rules-based explanation and actions based on the blended
-    XGBoost predictions. You can tweak the thresholds later.
+    Compute SHAP values for a single row, if possible.
     """
-    explanation_lines: List[str] = []
-    actions: List[str] = []
+    if explainer is None:
+        return []
 
-    # Schedule risk
-    if weeks_late <= 1:
-        explanation_lines.append(
-            "The project is forecast to be close to the planned completion date."
-        )
-    elif weeks_late <= 4:
-        explanation_lines.append(
-            "The project shows a moderate schedule risk with a small forecast delay."
-        )
-        actions.append("Investigate trades with recent schedule slippage and confirm recovery plans.")
+    try:
+        X = _align_features_for_model(df_numeric, expected_cols, f"{label} SHAP")
+        sv = explainer.shap_values(X)
+        # sv might be shape (n_samples, n_features)
+        if isinstance(sv, list):
+            sv = sv[0]
+        if isinstance(sv, np.ndarray):
+            return sv[0].tolist()
+        return []
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("%s SHAP failed: %s", label, exc)
+        return []
+
+
+def _simple_explanation_text(weeks_late: float, cost_overrun_pct: float) -> str:
+    """
+    Lightweight, non-LLM explanation that always works (even without OpenAI).
+    """
+    if weeks_late <= 0.5 and abs(cost_overrun_pct) < 2:
+        risk_level = "low risk"
+    elif weeks_late <= 4 and cost_overrun_pct < 10:
+        risk_level = "moderate risk"
     else:
-        explanation_lines.append(
-            "The project shows a high schedule risk with a significant forecast delay."
-        )
-        actions.append("Escalate schedule risk and consider re-sequencing or adding resources.")
+        risk_level = "elevated risk"
 
-    # Cost risk
-    if cost_overrun_pct <= 2:
-        explanation_lines.append(
-            "Cost performance is forecast to be close to the original budget."
-        )
-    elif cost_overrun_pct <= 10:
-        explanation_lines.append(
-            "The project is forecast to have a moderate cost overrun."
-        )
-        actions.append("Review contingency, variations and at-risk trades for additional cost controls.")
-    else:
-        explanation_lines.append(
-            "The project is forecast to have a significant cost overrun."
-        )
-        actions.append("Escalate cost risk and review major contracts, scope and claims in detail.")
-
-    if not actions:
-        actions.append(
-            "Continue to monitor progress and costs, but no major risk intervention is recommended at this stage."
-        )
-
-    explanation_text = " ".join(explanation_lines)
-    return explanation_text, actions
+    return (
+        f"The project is currently assessed as {risk_level}. "
+        f"Schedule performance is forecast at roughly {weeks_late:.1f} weeks "
+        f"{'late' if weeks_late >= 0 else 'ahead of plan'}, while cost "
+        f"performance is forecast at about {cost_overrun_pct:.1f}% "
+        f"{'over' if cost_overrun_pct >= 0 else 'under'} the original budget."
+    )
 
 
 # ---------------------------------------------------------------------------
 # Public API functions
 # ---------------------------------------------------------------------------
 
+
 def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
     """
-    Takes one project's feature row(s) and returns a JSON-ready dictionary
-    with predictions, SHAP values, and simple explanation text.
+    Main entry point used by FastAPI.
 
-    df_project may contain multiple rows, but we assume it is already
-    aggregated to a single project; if not, we use the first row.
+    df_project: dataframe containing data for a **single project**.
+                It can be raw transactions or pre-aggregated features.
+                Any numeric columns will be used for modelling.
     """
-    if df_project.empty:
-        raise ValueError("df_project is empty")
 
-    # If multiple rows, take the first aggregated row
-    df_project = df_project.iloc[[0]].copy()
+    if df_project is None or df_project.empty:
+        return {
+            "project_id": "unknown",
+            "predictions": {
+                "weeks_late": 0.0,
+                "cost_overrun_percent": 0.0,
+                "blended_weeks_late": 0.0,
+                "blended_cost_overrun_percent": 0.0,
+                "xgb_weeks_late": 0.0,
+                "xgb_cost_overrun_percent": 0.0,
+                "transformer_weeks_late": None,
+                "transformer_cost_overrun_percent": None,
+                "gnn_weeks_late": None,
+                "gnn_cost_overrun_percent": None,
+            },
+            "shap": {"weeks_late": [], "cost_overrun_percent": []},
+            "trade_risks": [],
+            "explanation_text": "No project data was provided.",
+            "recommended_actions": [],
+            "llm_used": False,
+            "llm_error": "No data",
+            "source_id": None,
+        }
 
-    # Try to find a project_id if present
+    # Try to get a project_id if one exists
     project_id = None
-    for col in ("project_id", "Project_ID", "project_code"):
-        if col in df_project.columns:
-            project_id = str(df_project[col].iloc[0])
-            break
+    for candidate in ["project_id", "ProjectID", "project"]:
+        if candidate in df_project.columns:
+            try:
+                project_id = str(df_project[candidate].iloc[0])
+                break
+            except Exception:
+                pass
     if project_id is None:
         project_id = "unknown"
 
-    # --- XGBoost predictions ---
-    weeks_xgb, shap_weeks = _predict_with_xgb(
-        model_weeks,
-        explainer_weeks,
-        df_project,
-        XGB_DELAY_FEATURES,
-        label="delay",
+    # Prepare numeric features
+    df_numeric = _numericise_dataframe(df_project)
+
+    # --- XGBoost predictions -------------------------------------------------
+    xgb_weeks = _predict_with_xgb(
+        model_weeks, df_numeric, DELAY_FEATURES, label="delay"
+    )
+    xgb_cost_pct = _predict_with_xgb(
+        model_cost, df_numeric, COST_FEATURES, label="cost"
     )
 
-    cost_xgb, shap_cost = _predict_with_xgb(
-        model_cost,
-        explainer_cost,
-        df_project,
-        XGB_COST_FEATURES,
-        label="cost",
+    shap_weeks = _compute_shap_values(
+        explainer_weeks, df_numeric, DELAY_FEATURES, label="delay"
+    )
+    shap_cost = _compute_shap_values(
+        explainer_cost, df_numeric, COST_FEATURES, label="cost"
     )
 
-    # For now we don't have transformer / GNN models wired in this file;
-    # keep them as None so the API schema remains stable.
-    transformer_weeks = None
-    transformer_cost = None
-    gnn_weeks = None
-    gnn_cost = None
+    # --- Transformer / GNN placeholders -------------------------------------
+    transformer_weeks: Optional[float] = None
+    transformer_cost_pct: Optional[float] = None
 
-    # Blended metrics – for now just use XGB; you can later combine multiple models
-    blended_weeks = weeks_xgb
-    blended_cost = cost_xgb
+    gnn_weeks: Optional[float] = None
+    gnn_cost_pct: Optional[float] = None
 
-    explanation_text, actions = _build_explanation(
-        weeks_late=blended_weeks,
-        cost_overrun_pct=blended_cost,
-    )
+    # You can wire in real models later; for now we just log that they're null.
+    if not TRANSFORMER_MODEL_PATH.exists():
+        logger.info("Transformer model file not found; transformer outputs will be null.")
+    if gnn_weeks is None and gnn_cost_pct is None:
+        logger.info("GNN models not configured; GNN outputs will be null.")
 
-    summary: Dict[str, Any] = {
+    # --- Blended scores (for now just equal to XGBoost) ---------------------
+    blended_weeks = xgb_weeks
+    blended_cost_pct = xgb_cost_pct
+
+    # --- Simple explanation & recommendations -------------------------------
+    explanation = _simple_explanation_text(blended_weeks, blended_cost_pct)
+
+    recommended_actions: List[str] = []
+    if blended_weeks > 2 or blended_cost_pct > 5:
+        recommended_actions.append(
+            "Review the largest trades and recent payment history to identify drivers of delay and cost pressure."
+        )
+    if blended_weeks <= 2 and blended_cost_pct <= 5:
+        recommended_actions.append(
+            "Continue to monitor progress and costs; no major risk intervention is recommended at this stage."
+        )
+    if not recommended_actions:
+        recommended_actions.append(
+            "Engage the project team to validate these risk signals and agree on a mitigation plan."
+        )
+
+    # We are not actually calling OpenAI here, so we mark the LLM as unused.
+    llm_used = False
+    llm_error = "OPENAI_API_KEY environment variable is not set."
+
+    # Try to infer a source_id if csv filename was known upstream; otherwise use project_id.
+    source_id = os.environ.get("CURRENT_SOURCE_ID", f"{project_id}.csv")
+
+    return {
         "project_id": project_id,
         "predictions": {
             "weeks_late": float(blended_weeks),
-            "cost_overrun_percent": float(blended_cost),
+            "cost_overrun_percent": float(blended_cost_pct),
             "blended_weeks_late": float(blended_weeks),
-            "blended_cost_overrun_percent": float(blended_cost),
-            "xgb_weeks_late": float(weeks_xgb),
-            "xgb_cost_overrun_percent": float(cost_xgb),
+            "blended_cost_overrun_percent": float(blended_cost_pct),
+            "xgb_weeks_late": float(xgb_weeks),
+            "xgb_cost_overrun_percent": float(xgb_cost_pct),
             "transformer_weeks_late": transformer_weeks,
-            "transformer_cost_overrun_percent": transformer_cost,
+            "transformer_cost_overrun_percent": transformer_cost_pct,
             "gnn_weeks_late": gnn_weeks,
-            "gnn_cost_overrun_percent": gnn_cost,
+            "gnn_cost_overrun_percent": gnn_cost_pct,
         },
         "shap": {
             "weeks_late": shap_weeks,
             "cost_overrun_percent": shap_cost,
         },
-        "trade_risks": [],  # future: per-trade risk outputs
-        "explanation_text": explanation_text,
-        "recommended_actions": actions,
-        "llm_used": False,
-        "llm_error": "OPENAI_API_KEY environment variable is not set.",
-        "source_id": df_project.get("source_id", pd.Series([None])).iloc[0] or f"{project_id}.csv",
+        "trade_risks": [],  # placeholder for future per-trade risk flags
+        "explanation_text": explanation,
+        "recommended_actions": recommended_actions,
+        "llm_used": llm_used,
+        "llm_error": llm_error,
+        "source_id": source_id,
     }
-
-    return summary
 
 
 def batch_predict(df_all: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    Batch version: group by project_id (if present) and run
-    make_risk_summary_from_df for each project.
+    Batch version used by CLI tools / tests: group by project_id (if present)
+    and run make_risk_summary_from_df for each group.
     """
     outputs: List[Dict[str, Any]] = []
 
+    if df_all is None or df_all.empty:
+        return outputs
+
     if "project_id" not in df_all.columns:
-        # Treat entire frame as a single project
+        # Treat entire dataframe as one project
         outputs.append(make_risk_summary_from_df(df_all))
         return outputs
 
     for pid, group in df_all.groupby("project_id"):
-        try:
-            outputs.append(make_risk_summary_from_df(group))
-        except Exception as exc:  # pragma: no cover
-            logger.warning("[ml_core] batch_predict failed for project %s: %s", pid, exc)
+        outputs.append(make_risk_summary_from_df(group.reset_index(drop=True)))
 
     return outputs
