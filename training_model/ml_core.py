@@ -1,50 +1,39 @@
 """
-ml_core for IPEX Oracle.
+Full ML core for IPEX Oracle.
 
-This module is called by the FastAPI app to:
-- Load ML models (XGBoost tabular models, SHAP explainers, optional Transformer).
-- Turn one project's raw transaction dataframe into model-ready features.
-- Run predictions and return a JSON-ready risk summary.
+- Uses XGBoost models for weeks-late and cost-overrun predictions.
+- Uses SHAP explainers for feature attributions (when available).
+- Is robust to:
+    * missing feature columns
+    * non-numeric values in feature columns
+    * missing model / explainer files in the deployed environment
 
-Design goals:
-- Safe in cloud environments (Railway) even if some model files are missing.
-- Backwards compatible with the API response shape you've already wired up.
-- Easy to plug in your PyTorch Transformer via transformer_head.predict_project.
+Public API (used by FastAPI app):
+
+    make_risk_summary_from_df(df_project) -> dict
+    batch_predict(df_all) -> list[dict]
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
+import logging
+
+import joblib
 import numpy as np
 import pandas as pd
-import os
 
-# Optional deps – code still imports if some are missing.
-try:
-    import joblib  # type: ignore
-except Exception:  # pragma: no cover
-    joblib = None  # type: ignore
-
+# Optional dependencies (SHAP / torch etc.) – imported lazily where needed
 try:
     import shap  # type: ignore
 except Exception:  # pragma: no cover
     shap = None  # type: ignore
 
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
-# Try relative import first (package) then flat (module)
-try:
-    from . import transformer_head  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        import transformer_head  # type: ignore
-    except Exception:
-        transformer_head = None  # type: ignore
+logger = logging.getLogger("ml_core")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -55,101 +44,35 @@ BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_DELAY_PATH = BASE_DIR / "model_weeks_late.pkl"
 MODEL_COST_PATH = BASE_DIR / "model_overrun_percent.pkl"
+
 EXPLAINER_DELAY_PATH = BASE_DIR / "explainer_weeks_late.pkl"
 EXPLAINER_COST_PATH = BASE_DIR / "explainer_overrun_percent.pkl"
 
+# (Transformer artefacts – wired later if needed)
 TRANSFORMER_MODEL_PATH = BASE_DIR / "transformer_model.pt"
 TRANSFORMER_NORM_STATS_PATH = BASE_DIR / "transformer_norm_stats.npz"
 
 
 # ---------------------------------------------------------------------------
-# Global model handles (lazy-loaded once)
+# Feature lists used when the XGBoost models were trained
+# (must match training_projects_train.csv / training code)
 # ---------------------------------------------------------------------------
 
-_models_loaded = False
-
-_model_weeks: Optional[Any] = None
-_model_cost: Optional[Any] = None
-
-_explainer_weeks: Optional[Any] = None
-_explainer_cost: Optional[Any] = None
-
-_transformer_model: Optional[Any] = None
-_transformer_norm_stats: Optional[Any] = None
-
-
-def _load_models_once() -> None:
-    """
-    Load XGBoost models, SHAP explainers and Transformer once.
-    Safe to call multiple times – it only loads on first call.
-    """
-    global _models_loaded
-    global _model_weeks, _model_cost
-    global _explainer_weeks, _explainer_cost
-    global _transformer_model, _transformer_norm_stats
-
-    if _models_loaded:
-        return
-
-    print("[ml_core] Loading models…")
-
-    # --- XGBoost models -----------------------------------------------------
-    if joblib is not None and MODEL_DELAY_PATH.exists():
-        try:
-            _model_weeks = joblib.load(MODEL_DELAY_PATH)
-            print(f"[ml_core] Loaded weeks-late model from {MODEL_DELAY_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading weeks model: {exc}")
-
-    if joblib is not None and MODEL_COST_PATH.exists():
-        try:
-            _model_cost = joblib.load(MODEL_COST_PATH)
-            print(f"[ml_core] Loaded cost-overrun model from {MODEL_COST_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading cost model: {exc}")
-
-    # --- SHAP explainers ----------------------------------------------------
-    if joblib is not None and EXPLAINER_DELAY_PATH.exists():
-        try:
-            _explainer_weeks = joblib.load(EXPLAINER_DELAY_PATH)
-            print(f"[ml_core] Loaded weeks explainer from {EXPLAINER_DELAY_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading weeks explainer: {exc}")
-
-    if joblib is not None and EXPLAINER_COST_PATH.exists():
-        try:
-            _explainer_cost = joblib.load(EXPLAINER_COST_PATH)
-            print(f"[ml_core] Loaded cost explainer from {EXPLAINER_COST_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading cost explainer: {exc}")
-
-    # --- Transformer model + normalisation stats ---------------------------
-    if torch is not None and TRANSFORMER_MODEL_PATH.exists():
-        try:
-            _transformer_model = torch.load(TRANSFORMER_MODEL_PATH, map_location="cpu")
-            if hasattr(_transformer_model, "eval"):
-                _transformer_model.eval()
-            print(f"[ml_core] Loaded transformer model from {TRANSFORMER_MODEL_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading transformer model: {exc}")
-            _transformer_model = None
-
-    if TRANSFORMER_NORM_STATS_PATH.exists():
-        try:
-            _transformer_norm_stats = np.load(TRANSFORMER_NORM_STATS_PATH)
-            print(f"[ml_core] Loaded transformer norm stats from {TRANSFORMER_NORM_STATS_PATH.name}")
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING loading transformer norm stats: {exc}")
-            _transformer_norm_stats = None
-
-    _models_loaded = True
-
-
-# ---------------------------------------------------------------------------
-# Helpers – cleaning & feature engineering
-# ---------------------------------------------------------------------------
-
-_FEATURE_COLUMNS = [
+XGB_DELAY_FEATURES: List[str] = [
+    "project_value_num2",
+    "project_duration_days2",
+    "project_day",
+    "pct_time_elapsed",
+    "payment_amount_num",
+    "cum_project_paid",
+    "pct_project_paid",
+    "trade_value_share",
+    "is_large_trade",
+    "days_since_last_trade_payment",
+    "trade_duration_days",
+    "pct_trade_time_elapsed",
+    "pct_trade_paid",
+    "trade_schedule_lag",
     "planned_cost",
     "planned_duration_days",
     "num_payments",
@@ -159,379 +82,287 @@ _FEATURE_COLUMNS = [
     "trade_cost_concentration",
 ]
 
+# For now cost model uses the same feature set; if you trained with a
+# slightly different set, edit this list accordingly.
+XGB_COST_FEATURES: List[str] = list(XGB_DELAY_FEATURES)
 
-def _to_numeric_series(series: pd.Series) -> pd.Series:
+
+# ---------------------------------------------------------------------------
+# Load models and explainers (with safety)
+# ---------------------------------------------------------------------------
+
+def _safe_load(path: Path, description: str) -> Any:
+    if not path.exists():
+        logger.warning("[ml_core] %s file missing: %s", description, path)
+        return None
+    try:
+        obj = joblib.load(path)
+        logger.info("[ml_core] Loaded %s from %s", description, path.name)
+        return obj
+    except Exception as exc:  # pragma: no cover
+        logger.exception("[ml_core] Failed to load %s from %s: %s", description, path, exc)
+        return None
+
+
+model_weeks = _safe_load(MODEL_DELAY_PATH, "XGB weeks-late model")
+model_cost = _safe_load(MODEL_COST_PATH, "XGB cost-overrun model")
+
+explainer_weeks = _safe_load(EXPLAINER_DELAY_PATH, "SHAP weeks-late explainer") if shap else None
+explainer_cost = _safe_load(EXPLAINER_COST_PATH, "SHAP cost-overrun explainer") if shap else None
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def _ensure_numeric_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """
-    Convert a Series with values like '$1,234.56' or '-$500'
-    into clean float numbers. Invalid values -> 0.0.
+    Coerce the specified columns to numeric, with errors -> NaN -> 0.0.
+    This avoids "Could not convert string '...$104.70-...'" errors.
     """
-    s = (
-        series.astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("$", "", regex=False)
-        .str.replace(" ", "", regex=False)
-    )
-    return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(float)
-
-
-def _safe_get_first(df: pd.DataFrame, cols: List[str]) -> float:
-    """Return first non-null value from the first existing column; else 0."""
+    df = df.copy()
     for col in cols:
-        if col in df.columns and len(df[col]) > 0:
-            val = df[col].iloc[0]
-            try:
-                if pd.notna(val):
-                    return float(val)
-            except Exception:
-                # might be a string date or weird format
-                continue
-    return 0.0
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Only fillna on columns that actually exist
+    existing = [c for c in cols if c in df.columns]
+    if existing:
+        df[existing] = df[existing].fillna(0.0)
+    return df
 
 
-def _build_features_from_raw(df_project: pd.DataFrame) -> pd.DataFrame:
+def _build_feature_matrix(
+    df_project: pd.DataFrame, feature_names: List[str], label: str
+) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Build the tabular features the XGBoost models expect.
+    Return a DataFrame X with *exactly* the columns in feature_names:
+    - any missing columns are added and filled with 0.0
+    - all columns are coerced to numeric
+    - column order is fixed
 
-    Matches the training columns in training_projects_train.csv:
-      planned_cost
-      planned_duration_days
-      num_payments
-      avg_payment_amount
-      num_trades
-      max_trade_paid
-      trade_cost_concentration
+    Returns (X, missing_features).
     """
     df = df_project.copy()
 
-    # planned_cost
-    planned_cost = _safe_get_first(
-        df,
-        ["planned_cost", "project_value", "contract_sum", "project_contract_value"],
-    )
+    # Coerce any existing feature columns to numeric
+    df = _ensure_numeric_columns(df, feature_names)
 
-    # planned_duration_days (or derive from dates)
-    if "planned_duration_days" in df.columns and len(df) > 0:
-        try:
-            planned_duration_days = float(df["planned_duration_days"].iloc[0])
-        except Exception:
-            planned_duration_days = 0.0
-    else:
-        planned_duration_days = 0.0
-        # Try to derive from dates
-        start_val = None
-        end_val = None
+    missing = [c for c in feature_names if c not in df.columns]
+    if missing:
+        logger.warning(
+            "[ml_core] %s model: input missing %d feature(s): %s – filling with 0.0",
+            label,
+            len(missing),
+            ", ".join(missing),
+        )
+        for col in missing:
+            df[col] = 0.0
 
-        for col in ["project_contract_start_date", "contract_start_date", "start_date"]:
-            if col in df.columns and len(df[col]) > 0:
-                start_val = df[col].iloc[0]
-                break
-
-        for col in ["project_completion_date", "planned_completion_date", "end_date"]:
-            if col in df.columns and len(df[col]) > 0:
-                end_val = df[col].iloc[0]
-                break
-
-        try:
-            if start_val is not None and end_val is not None:
-                start_dt = pd.to_datetime(start_val)
-                end_dt = pd.to_datetime(end_val)
-                planned_duration_days = float((end_dt - start_dt).days)
-        except Exception:
-            planned_duration_days = 0.0
-
-    # num_payments
-    num_payments = float(len(df)) if len(df) > 0 else 0.0
-
-    # payment amount stats
-    payment_col = None
-    for col in ["payment_amount", "amount", "payment_value"]:
-        if col in df.columns:
-            payment_col = col
-            break
-
-    if payment_col is not None and len(df) > 0:
-        payments = _to_numeric_series(df[payment_col])
-        avg_payment_amount = float(payments.mean())
-        total_paid = float(payments.sum())
-    else:
-        avg_payment_amount = 0.0
-        total_paid = 0.0
-
-    # trade metrics
-    trade_col = None
-    for col in ["trade_id", "trade_work_type", "trade_name"]:
-        if col in df.columns:
-            trade_col = col
-            break
-
-    if trade_col is not None and payment_col is not None:
-        df_pay = df.copy()
-        df_pay[payment_col] = _to_numeric_series(df_pay[payment_col])
-
-        grouped = df_pay.groupby(trade_col)[payment_col].sum()
-        num_trades = float(grouped.shape[0])
-        if grouped.shape[0] > 0:
-            max_trade_paid = float(grouped.max())
-            trade_cost_concentration = float(max_trade_paid / total_paid) if total_paid > 0 else 0.0
-        else:
-            num_trades = 0.0
-            max_trade_paid = 0.0
-            trade_cost_concentration = 0.0
-    else:
-        num_trades = 0.0
-        max_trade_paid = 0.0
-        trade_cost_concentration = 0.0
-
-    row = {
-        "planned_cost": planned_cost,
-        "planned_duration_days": planned_duration_days,
-        "num_payments": num_payments,
-        "avg_payment_amount": avg_payment_amount,
-        "num_trades": num_trades,
-        "max_trade_paid": max_trade_paid,
-        "trade_cost_concentration": trade_cost_concentration,
-    }
-
-    X = pd.DataFrame([row], columns=_FEATURE_COLUMNS)
-    return X
+    # Ensure correct order and only the expected columns
+    X = df.reindex(columns=feature_names)
+    return X, missing
 
 
-# ---------------------------------------------------------------------------
-# XGBoost + SHAP execution
-# ---------------------------------------------------------------------------
-
-def _run_xgboost_models(
+def _predict_with_xgb(
+    model: Any,
+    explainer: Any,
     df_project: pd.DataFrame,
-) -> Tuple[float, float, Dict[str, List[Dict[str, float]]]]:
+    feature_names: List[str],
+    label: str,
+) -> Tuple[float, List[float]]:
     """
-    Run XGBoost weeks-late and cost-overrun models.
-    Returns:
-        weeks_pred, cost_pred, shap_info
+    Run an XGBoost model + SHAP (if available) on a single-project DataFrame.
+
+    Returns (prediction, shap_values_list).
+    If anything fails, returns (0.0, []) and logs a warning.
     """
-    _load_models_once()
-    shap_info: Dict[str, List[Dict[str, float]]] = {
-        "weeks_late": [],
-        "cost_overrun_percent": [],
-    }
-
-    # If models are missing, just return zeros
-    if _model_weeks is None and _model_cost is None:
-        return 0.0, 0.0, shap_info
-
-    X = _build_features_from_raw(df_project)
-
-    weeks_pred = 0.0
-    cost_pred = 0.0
-
-    # weeks model
-    if _model_weeks is not None:
-        try:
-            weeks_pred = float(_model_weeks.predict(X)[0])
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING: weeks model predict failed: {exc}")
-            weeks_pred = 0.0
-
-        if _explainer_weeks is not None and shap is not None:
-            try:
-                sv = _explainer_weeks(X)  # TreeExplainer / Explanation / array
-                if hasattr(sv, "values"):
-                    vals = np.asarray(sv.values)[0]
-                else:
-                    vals = np.asarray(sv)[0]
-                for col, val, s in zip(X.columns, X.iloc[0].tolist(), vals.tolist()):
-                    shap_info["weeks_late"].append(
-                        {"feature": col, "value": float(val), "shap": float(s)}
-                    )
-            except Exception as exc:  # pragma: no cover
-                print(f"[ml_core] WARNING: weeks SHAP failed: {exc}")
-
-    # cost model
-    if _model_cost is not None:
-        try:
-            cost_pred = float(_model_cost.predict(X)[0])
-        except Exception as exc:  # pragma: no cover
-            print(f"[ml_core] WARNING: cost model predict failed: {exc}")
-            cost_pred = 0.0
-
-        if _explainer_cost is not None and shap is not None:
-            try:
-                sv = _explainer_cost(X)
-                if hasattr(sv, "values"):
-                    vals = np.asarray(sv.values)[0]
-                else:
-                    vals = np.asarray(sv)[0]
-                for col, val, s in zip(X.columns, X.iloc[0].tolist(), vals.tolist()):
-                    shap_info["cost_overrun_percent"].append(
-                        {"feature": col, "value": float(val), "shap": float(s)}
-                    )
-            except Exception as exc:  # pragma: no cover
-                print(f"[ml_core] WARNING: cost SHAP failed: {exc}")
-
-    return weeks_pred, cost_pred, shap_info
-
-
-# ---------------------------------------------------------------------------
-# Transformer execution (via transformer_head.predict_project)
-# ---------------------------------------------------------------------------
-
-def _run_transformer(
-    df_project: pd.DataFrame,
-) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Run your Transformer on a single project.
-
-    Delegates to transformer_head.predict_project if available.
-    Returns (weeks_late, cost_overrun_percent) or (None, None).
-    """
-    _load_models_once()
-
-    if transformer_head is None or _transformer_model is None:
-        return None, None
+    if model is None:
+        logger.warning("[ml_core] %s model not loaded – returning 0.0", label)
+        return 0.0, []
 
     try:
-        if hasattr(transformer_head, "predict_project"):
-            weeks, cost = transformer_head.predict_project(
-                df_project=df_project,
-                model=_transformer_model,
-                norm_stats=_transformer_norm_stats,
-            )
-            if weeks is not None:
-                weeks = float(weeks)
-            if cost is not None:
-                cost = float(cost)
-            return weeks, cost
-    except Exception as exc:  # pragma: no cover
-        print(f"[ml_core] WARNING: transformer prediction failed: {exc}")
+        X, _ = _build_feature_matrix(df_project, feature_names, label)
+        # XGBoost returns np.ndarray; we expect a single-row prediction
+        y_pred = float(model.predict(X)[0])
 
-    return None, None
+        shap_vals: List[float] = []
+        if explainer is not None and shap is not None:
+            try:
+                # Some explainers return (n_samples, n_features)
+                sv = explainer.shap_values(X)
+                # Ensure we handle both list-of-arrays and single array forms
+                if isinstance(sv, list):
+                    sv_arr = np.array(sv[0])
+                else:
+                    sv_arr = np.array(sv)
+                shap_vals = sv_arr[0].astype(float).tolist()
+            except Exception as exc:  # pragma: no cover
+                logger.warning("[ml_core] %s SHAP failed: %s", label, exc)
+
+        return y_pred, shap_vals
+
+    except Exception as exc:  # pragma: no cover
+        logger.warning("[ml_core] %s model predict failed: %s", label, exc)
+        return 0.0, []
+
+
+def _build_explanation(
+    weeks_late: float,
+    cost_overrun_pct: float,
+) -> Tuple[str, List[str]]:
+    """
+    Very simple rules-based explanation and actions based on the blended
+    XGBoost predictions. You can tweak the thresholds later.
+    """
+    explanation_lines: List[str] = []
+    actions: List[str] = []
+
+    # Schedule risk
+    if weeks_late <= 1:
+        explanation_lines.append(
+            "The project is forecast to be close to the planned completion date."
+        )
+    elif weeks_late <= 4:
+        explanation_lines.append(
+            "The project shows a moderate schedule risk with a small forecast delay."
+        )
+        actions.append("Investigate trades with recent schedule slippage and confirm recovery plans.")
+    else:
+        explanation_lines.append(
+            "The project shows a high schedule risk with a significant forecast delay."
+        )
+        actions.append("Escalate schedule risk and consider re-sequencing or adding resources.")
+
+    # Cost risk
+    if cost_overrun_pct <= 2:
+        explanation_lines.append(
+            "Cost performance is forecast to be close to the original budget."
+        )
+    elif cost_overrun_pct <= 10:
+        explanation_lines.append(
+            "The project is forecast to have a moderate cost overrun."
+        )
+        actions.append("Review contingency, variations and at-risk trades for additional cost controls.")
+    else:
+        explanation_lines.append(
+            "The project is forecast to have a significant cost overrun."
+        )
+        actions.append("Escalate cost risk and review major contracts, scope and claims in detail.")
+
+    if not actions:
+        actions.append(
+            "Continue to monitor progress and costs, but no major risk intervention is recommended at this stage."
+        )
+
+    explanation_text = " ".join(explanation_lines)
+    return explanation_text, actions
 
 
 # ---------------------------------------------------------------------------
-# Public API used by FastAPI
+# Public API functions
 # ---------------------------------------------------------------------------
 
 def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
     """
-    Main entry point: one project's raw dataframe in, JSON-style dict out.
-    This function MUST NOT raise – any internal error falls back to zeros.
-    """
+    Takes one project's feature row(s) and returns a JSON-ready dictionary
+    with predictions, SHAP values, and simple explanation text.
 
-    # project_id
-    if "project_id" in df_project.columns and len(df_project["project_id"]) > 0:
-        project_id = str(df_project["project_id"].iloc[0])
-    else:
+    df_project may contain multiple rows, but we assume it is already
+    aggregated to a single project; if not, we use the first row.
+    """
+    if df_project.empty:
+        raise ValueError("df_project is empty")
+
+    # If multiple rows, take the first aggregated row
+    df_project = df_project.iloc[[0]].copy()
+
+    # Try to find a project_id if present
+    project_id = None
+    for col in ("project_id", "Project_ID", "project_code"):
+        if col in df_project.columns:
+            project_id = str(df_project[col].iloc[0])
+            break
+    if project_id is None:
         project_id = "unknown"
 
-    # source id (for trace/debug)
-    attrs = getattr(df_project, "attrs", {}) or {}
-    source_id = str(attrs.get("source_id", f"{project_id}.csv"))
+    # --- XGBoost predictions ---
+    weeks_xgb, shap_weeks = _predict_with_xgb(
+        model_weeks,
+        explainer_weeks,
+        df_project,
+        XGB_DELAY_FEATURES,
+        label="delay",
+    )
 
-    # Defaults in case anything fails
-    xgb_weeks = 0.0
-    xgb_cost = 0.0
-    shap_info: Dict[str, List[Dict[str, float]]] = {
-        "weeks_late": [],
-        "cost_overrun_percent": [],
-    }
-    transformer_weeks: Optional[float] = None
-    transformer_cost: Optional[float] = None
+    cost_xgb, shap_cost = _predict_with_xgb(
+        model_cost,
+        explainer_cost,
+        df_project,
+        XGB_COST_FEATURES,
+        label="cost",
+    )
 
-    # ---- XGB + SHAP --------------------------------------------------------
-    try:
-        xgb_weeks, xgb_cost, shap_info = _run_xgboost_models(df_project)
-    except Exception as exc:  # pragma: no cover
-        print(f"[ml_core] ERROR during XGBoost pipeline: {exc}")
-        xgb_weeks = 0.0
-        xgb_cost = 0.0
-        shap_info = {
-            "weeks_late": [],
-            "cost_overrun_percent": [],
-        }
+    # For now we don't have transformer / GNN models wired in this file;
+    # keep them as None so the API schema remains stable.
+    transformer_weeks = None
+    transformer_cost = None
+    gnn_weeks = None
+    gnn_cost = None
 
-    # ---- Transformer -------------------------------------------------------
-    try:
-        transformer_weeks, transformer_cost = _run_transformer(df_project)
-    except Exception as exc:  # pragma: no cover
-        print(f"[ml_core] ERROR during Transformer pipeline: {exc}")
-        transformer_weeks, transformer_cost = None, None
+    # Blended metrics – for now just use XGB; you can later combine multiple models
+    blended_weeks = weeks_xgb
+    blended_cost = cost_xgb
 
-    # ---- Blended = same as before (just XGB for now) ----------------------
-    blended_weeks = xgb_weeks
-    blended_cost = xgb_cost
+    explanation_text, actions = _build_explanation(
+        weeks_late=blended_weeks,
+        cost_overrun_pct=blended_cost,
+    )
 
-    # ---- Simple explanation logic (same style as before) -------------------
-    if blended_weeks > 8 or blended_cost > 10:
-        explanation_text = (
-            "The project is forecast to finish significantly late and/or over budget "
-            "based on payment and contract data."
-        )
-        recommended_actions = [
-            "Review the critical trades driving delay and cost.",
-            "Re-baseline the schedule and agree a recovery plan with key subcontractors.",
-        ]
-    elif blended_weeks > 2 or blended_cost > 5:
-        explanation_text = (
-            "The project shows moderate schedule or cost risk. "
-            "Performance should be closely monitored."
-        )
-        recommended_actions = [
-            "Increase monitoring of cashflow and site progress.",
-            "Review high-value trades for potential slippage.",
-        ]
-    else:
-        explanation_text = (
-            "The project is forecast to be close to the planned completion date "
-            "and near the original budget based on current data."
-        )
-        recommended_actions = [
-            "Continue to monitor progress and costs, "
-            "but no major risk intervention is recommended at this stage."
-        ]
-
-    llm_used = False
-    llm_error = ""
-    if "OPENAI_API_KEY" not in os.environ:
-        llm_error = "OPENAI_API_KEY environment variable is not set."
-
-    return {
+    summary: Dict[str, Any] = {
         "project_id": project_id,
         "predictions": {
-            # headline
-            "weeks_late": blended_weeks,
-            "cost_overrun_percent": blended_cost,
-            "blended_weeks_late": blended_weeks,
-            "blended_cost_overrun_percent": blended_cost,
-            # XGB base models
-            "xgb_weeks_late": xgb_weeks,
-            "xgb_cost_overrun_percent": xgb_cost,
-            # Transformer
+            "weeks_late": float(blended_weeks),
+            "cost_overrun_percent": float(blended_cost),
+            "blended_weeks_late": float(blended_weeks),
+            "blended_cost_overrun_percent": float(blended_cost),
+            "xgb_weeks_late": float(weeks_xgb),
+            "xgb_cost_overrun_percent": float(cost_xgb),
             "transformer_weeks_late": transformer_weeks,
             "transformer_cost_overrun_percent": transformer_cost,
-            # GNN reserved
-            "gnn_weeks_late": None,
-            "gnn_cost_overrun_percent": None,
+            "gnn_weeks_late": gnn_weeks,
+            "gnn_cost_overrun_percent": gnn_cost,
         },
-        "shap": shap_info,
-        "trade_risks": [],
+        "shap": {
+            "weeks_late": shap_weeks,
+            "cost_overrun_percent": shap_cost,
+        },
+        "trade_risks": [],  # future: per-trade risk outputs
         "explanation_text": explanation_text,
-        "recommended_actions": recommended_actions,
-        "llm_used": llm_used,
-        "llm_error": llm_error,
-        "source_id": source_id,
+        "recommended_actions": actions,
+        "llm_used": False,
+        "llm_error": "OPENAI_API_KEY environment variable is not set.",
+        "source_id": df_project.get("source_id", pd.Series([None])).iloc[0] or f"{project_id}.csv",
     }
+
+    return summary
 
 
 def batch_predict(df_all: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    Batch version: group by project_id and call make_risk_summary_from_df.
+    Batch version: group by project_id (if present) and run
+    make_risk_summary_from_df for each project.
     """
     outputs: List[Dict[str, Any]] = []
 
     if "project_id" not in df_all.columns:
+        # Treat entire frame as a single project
         outputs.append(make_risk_summary_from_df(df_all))
         return outputs
 
-    for _, group in df_all.groupby("project_id"):
-        outputs.append(make_risk_summary_from_df(group))
+    for pid, group in df_all.groupby("project_id"):
+        try:
+            outputs.append(make_risk_summary_from_df(group))
+        except Exception as exc:  # pragma: no cover
+            logger.warning("[ml_core] batch_predict failed for project %s: %s", pid, exc)
 
     return outputs
