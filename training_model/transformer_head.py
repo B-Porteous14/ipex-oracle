@@ -1,259 +1,214 @@
-# transformer_head.py
+"""
+transformer_head.py
 
-from pathlib import Path
-import os
-from typing import Dict, Any, Optional
+Glue code between your raw project dataframe and the trained Transformer
+saved in `transformer_model.pt` + `transformer_norm_stats.npz`.
+
+This module exposes a single function:
+
+    predict_project(df_project, model, norm_stats) -> (weeks_late, cost_overrun%)
+
+It is called from ml_core._run_transformer().
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
+
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 
 
-# Base directory for this module (training_model/)
-BASE_DIR = Path(__file__).resolve().parent
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
-# Paths can be overridden by environment variables for deployment. By default
-# we look for the files next to this module, not in the process working dir.
-_default_model_path = BASE_DIR / "transformer_model.pt"
-_default_norm_path = BASE_DIR / "transformer_norm_stats.npz"
+# Columns we treat as *non-feature* meta columns and drop from the sequence.
+_META_COLUMNS = {
+    "project_id",
+    "Project_ID",
+    "project",
+    "payment_id",
+    "invoice_id",
+    "trade_id",
+    "trade_work_type",
+    "trade_name",
+    "supplier_name",
+    "company_name",
+}
 
-TRANSFORMER_MODEL_PATH = Path(os.getenv("TRANSFORMER_MODEL_PATH", str(_default_model_path)))
-TRANSFORMER_NORM_PATH = Path(os.getenv("TRANSFORMER_NORM_PATH", str(_default_norm_path)))
-
-SEQ_LEN = int(os.getenv("TRANSFORMER_SEQ_LEN", "8"))
-STRIDE = int(os.getenv("TRANSFORMER_STRIDE", "4"))
-
-FEATURE_COLS_TS = [
-    "t",
-    "days_since_first_payment",
-    "payment_amount",
-    "cum_project_paid",
-    "pct_project_paid",
-    "project_value",
-]
-
-TARGET_COLS = ["weeks_late", "cost_overrun_percent"]
+_DATE_COLUMNS = {
+    "payment_date",
+    "date",
+    "transaction_date",
+    "invoice_date",
+}
 
 
-def parse_money(value):
-    """Parse money strings like '$1,234.56' or '-$500.00' to float."""
-    if pd.isna(value):
-        return np.nan
-    s = str(value).strip()
-    if s == "":
-        return np.nan
-    neg = s.startswith("-")
-    s_clean = s.replace("-", "").replace("$", "").replace(",", "")
+def _sort_by_time(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort rows by a date-like column if present, otherwise return as-is."""
+    for col in df.columns:
+        if col in _DATE_COLUMNS:
+            try:
+                df_sorted = df.copy()
+                df_sorted[col] = pd.to_datetime(df_sorted[col], errors="coerce")
+                return df_sorted.sort_values(col).reset_index(drop=True)
+            except Exception:
+                continue
+    return df.reset_index(drop=True)
+
+
+def _select_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Choose numeric feature columns from the dataframe and drop known meta columns.
+
+    This is intentionally generic so it still works if you add/remove columns,
+    as long as the numeric feature set and order match what the Transformer
+    was trained on.
+    """
+    df_num = df.select_dtypes(include=["number"]).copy()
+
+    # Drop known meta columns if they happen to be numeric.
+    for col in list(df_num.columns):
+        if col in _META_COLUMNS:
+            df_num.drop(columns=[col], inplace=True)
+
+    return df_num
+
+
+def _apply_norm_stats(
+    x: np.ndarray,
+    norm_stats: Optional[Dict[str, np.ndarray]],
+) -> np.ndarray:
+    """
+    Apply per-feature normalisation if norm_stats contains 'mean' and 'std' arrays.
+
+    Expects:
+        x: [T, F]
+        norm_stats["mean"]: [F] or broadcastable
+        norm_stats["std"]:  [F] or broadcastable
+    """
+    if norm_stats is None:
+        return x
+
+    mean = norm_stats.get("mean")
+    std = norm_stats.get("std")
+
+    if mean is None or std is None:
+        return x
+
     try:
-        val = float(s_clean)
-    except ValueError:
-        return np.nan
-    return -val if neg else val
+        mean_arr = np.asarray(mean, dtype=np.float32)
+        std_arr = np.asarray(std, dtype=np.float32)
+        # Avoid divide-by-zero
+        std_arr = np.where(std_arr == 0, 1.0, std_arr)
+
+        # Broadcast if shapes don’t match perfectly
+        return (x - mean_arr) / std_arr
+    except Exception as exc:  # pragma: no cover
+        print(f"[transformer_head] WARNING: failed to apply norm stats: {exc}")
+        return x
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+# ---------------------------------------------------------------------------
+# Main entry point used by ml_core
+# ---------------------------------------------------------------------------
 
-        position = torch.arange(max_len).unsqueeze(1)  # (max_len, 1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model)
-        )
-
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, : x.size(1), :]
-        return self.dropout(x)
-
-
-class PaymentTransformer(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        num_targets: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 2,
-        dim_feedforward: int = 128,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
-        )
-
-        self.fc_out = nn.Linear(d_model, num_targets)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        x = x[:, -1, :]
-        return self.fc_out(x)
-
-
-def _load_model_and_norm() -> Optional[Dict[str, Any]]:
-    if not TRANSFORMER_MODEL_PATH.exists() or not TRANSFORMER_NORM_PATH.exists():
-        print("[transformer_head] Transformer model or norm stats not found. "
-              "Set TRANSFORMER_MODEL_PATH / TRANSFORMER_NORM_PATH or place "
-              ".pt and .npz files next to ml_core.py")
-        return None
-
-    norm = np.load(TRANSFORMER_NORM_PATH)
-
-    feat_mean = norm["mean"]
-    feat_std = norm["std"]
-    target_mean = norm["target_mean"]
-    target_std = norm["target_std"]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = PaymentTransformer(
-        input_dim=len(FEATURE_COLS_TS),
-        num_targets=len(TARGET_COLS),
-    )
-    model.load_state_dict(torch.load(TRANSFORMER_MODEL_PATH, map_location=device))
-    model.to(device)
-    model.eval()
-
-    return {
-        "model": model,
-        "device": device,
-        "feat_mean": feat_mean,
-        "feat_std": feat_std,
-        "target_mean": target_mean,
-        "target_std": target_std,
-    }
-
-
-# Lazy-loaded globals
-_state: Optional[Dict[str, Any]] = None
-TRANSFORMER_AVAILABLE = True
-
-
-def _ensure_loaded():
-    global _state, TRANSFORMER_AVAILABLE
-    if _state is not None or not TRANSFORMER_AVAILABLE:
-        return
-    _state = _load_model_and_norm()
-    if _state is None:
-        TRANSFORMER_AVAILABLE = False
-
-
-def build_timeseries_from_df(df_raw: pd.DataFrame, project_id: str) -> pd.DataFrame:
-    """Build a time-series dataframe matching transformer_training_data.csv schema
-    from a raw single-project payments dataframe (as used in ml_core.make_risk_summary_from_df).
+def predict_project(
+    df_project: pd.DataFrame,
+    model: Any,
+    norm_stats: Optional[Any] = None,
+) -> Tuple[Optional[float], Optional[float]]:
     """
-    df = df_raw.copy()
+    Run the Transformer for a single project.
 
-    if "payment_amount" not in df.columns or "payment_date" not in df.columns:
-        return pd.DataFrame(columns=FEATURE_COLS_TS + ["project_id"])
+    Args
+    ----
+    df_project:
+        Raw transactions dataframe for ONE project (multiple rows over time).
 
-    df["payment_amount_num"] = df["payment_amount"].apply(parse_money)
-    df["project_value_num"] = df.get("project_value", np.nan).apply(parse_money)
-    df["payment_date_parsed"] = pd.to_datetime(
-        df["payment_date"], dayfirst=True, errors="coerce"
-    )
+    model:
+        The loaded Transformer model (from transformer_model.pt), already moved
+        to CPU and put in eval() mode by ml_core.
 
-    df = df[df["payment_amount_num"].notna()].copy()
-    df = df[df["payment_date_parsed"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame(columns=FEATURE_COLS_TS + ["project_id"])
+    norm_stats:
+        Optional np.load(...) object from transformer_norm_stats.npz containing
+        'mean' and 'std' arrays, or None.
 
-    # Assume single project in the CSV
-    pv = df["project_value_num"].dropna()
-    project_value = pv.iloc[0] if not pv.empty else np.nan
-
-    df = df.sort_values("payment_date_parsed")
-
-    first_date = df["payment_date_parsed"].iloc[0]
-    df["days_since_first_payment"] = (
-        df["payment_date_parsed"] - first_date
-    ).dt.days
-
-    df["t"] = np.arange(len(df), dtype=int)
-    df["cum_project_paid"] = df["payment_amount_num"].cumsum()
-    df["pct_project_paid"] = np.where(
-        project_value > 0, df["cum_project_paid"] / project_value, 0.0
-    )
-
-    df["payment_amount"] = df["payment_amount_num"]
-    df["project_value"] = project_value
-
-    out = df[["t", "days_since_first_payment", "payment_amount",
-              "cum_project_paid", "pct_project_paid"]].copy()
-    out["project_value"] = project_value
-    out["project_id"] = project_id
-
-    return out
-
-
-def predict_transformer_from_df(df_raw: pd.DataFrame, project_id: str) -> Optional[Dict[str, float]]:
-    """Run the Transformer on a raw project dataframe and return
-    project-level predictions for weeks_late and cost_overrun_percent.
+    Returns
+    -------
+    (weeks_late, cost_overrun_percent) as floats, or (None, None) if something fails.
     """
-    _ensure_loaded()
-    if not TRANSFORMER_AVAILABLE or _state is None:
-        return None
+    if torch is None or model is None:
+        return None, None
 
-    ts = build_timeseries_from_df(df_raw, project_id)
-    if ts.empty or len(ts) < SEQ_LEN:
-        print(f"[transformer_head] Not enough timesteps for project {project_id} "
-              f"({len(ts)} < SEQ_LEN={SEQ_LEN}); skipping Transformer.")
-        return None
+    # 1) Sort by time so the sequence is in chronological order
+    df_sorted = _sort_by_time(df_project)
 
-    feat = ts[FEATURE_COLS_TS].values.astype("float32")
+    # 2) Build feature matrix [T, F]
+    df_feats = _select_feature_columns(df_sorted)
 
-    sequences = []
-    for start in range(0, len(ts) - SEQ_LEN + 1, STRIDE):
-        end = start + SEQ_LEN
-        sequences.append(feat[start:end])
+    if df_feats.shape[0] == 0 or df_feats.shape[1] == 0:
+        print("[transformer_head] No numeric feature columns available for Transformer.")
+        return None, None
 
-    if not sequences:
-        print(f"[transformer_head] No sequences built for project {project_id}; skipping Transformer.")
-        return None
+    x_np = df_feats.to_numpy(dtype=np.float32)  # [T, F]
 
-    X = np.stack(sequences, axis=0)  # (num_seqs, seq_len, num_features)
+    # 3) Apply normalisation if stats are provided
+    if norm_stats is not None:
+        try:
+            # np.load returns an NpzFile; we convert to dict-like.
+            if hasattr(norm_stats, "files"):
+                stats_dict = {k: norm_stats[k] for k in norm_stats.files}
+            else:
+                stats_dict = dict(norm_stats)
+        except Exception:
+            stats_dict = None
+    else:
+        stats_dict = None
 
-    feat_mean = _state["feat_mean"]
-    feat_std = _state["feat_std"]
-    target_mean = _state["target_mean"]
-    target_std = _state["target_std"]
-    model = _state["model"]
-    device = _state["device"]
+    x_np = _apply_norm_stats(x_np, stats_dict)  # [T, F]
 
-    X_norm = (X - feat_mean) / feat_std
-    X_tensor = torch.from_numpy(X_norm).to(device)
+    # 4) Add batch dimension -> [1, T, F]
+    x_np = np.expand_dims(x_np, axis=0)
+    x_tensor = torch.from_numpy(x_np)  # shape [1, T, F]
 
-    with torch.no_grad():
-        preds_norm = model(X_tensor)
+    # 5) Run the model
+    try:
+        model.eval()
+        with torch.no_grad():
+            output = model(x_tensor)
 
-    preds_norm_np = preds_norm.cpu().numpy()
-    preds_raw = preds_norm_np * target_std + target_mean
+        # Common patterns:
+        #   - output shape [1, 2] -> (weeks, cost)
+        #   - output shape [1]    -> weeks only
+        if isinstance(output, (list, tuple)):
+            output = output[0]
 
-    weeks = preds_raw[:, 0]
-    cost = preds_raw[:, 1]
+        if isinstance(output, torch.Tensor):
+            out_np = output.detach().cpu().numpy()
+        else:
+            out_np = np.asarray(output)
 
-    return {
-        "weeks_late": float(weeks.mean()),
-        "cost_overrun_percent": float(cost.mean()),
-    }
+        out_np = out_np.reshape(-1)
+
+        if out_np.size >= 2:
+            weeks_pred = float(out_np[0])
+            cost_pred = float(out_np[1])
+        elif out_np.size == 1:
+            weeks_pred = float(out_np[0])
+            cost_pred = 0.0
+        else:
+            print("[transformer_head] Transformer output is empty.")
+            return None, None
+
+        return weeks_pred, cost_pred
+
+    except Exception as exc:  # pragma: no cover
+        print(f"[transformer_head] ERROR during Transformer inference: {exc}")
+        return None, None
