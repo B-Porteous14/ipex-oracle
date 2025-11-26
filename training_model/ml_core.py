@@ -51,18 +51,49 @@ MODEL_COST = BASE_DIR / "model_overrun_percent.pkl"
 EXPLAINER_DELAY = BASE_DIR / "explainer_weeks_late.pkl"
 EXPLAINER_COST = BASE_DIR / "explainer_overrun_percent.pkl"
 
+
+# -----------------------------
+# Safe loader for models / explainers
+# -----------------------------
+
+def _safe_load_joblib(path: Path, label: str):
+    """
+    Try to load a joblib artefact. If the file is missing or broken,
+    log a warning and return None instead of crashing the server.
+
+    This is important for cloud deployments where .pkl files might not
+    yet be present. The rest of the code must handle the None case.
+    """
+    try:
+        if not path.exists():
+            print(f"[ml_core] WARNING: {label} not found at {path}. "
+                  f"Using placeholder behaviour (zero predictions).")
+            return None
+        obj = joblib.load(path)
+        print(f"[ml_core] Loaded {label} from {path}")
+        return obj
+    except Exception as e:
+        print(f"[ml_core] ERROR loading {label} from {path}: {e}. "
+              f"Using placeholder behaviour (zero predictions).")
+        return None
+
+
 # -----------------------------
 # Load XGBoost + SHAP explainers
 # -----------------------------
 print("[ml_core] Loading XGBoost models and SHAP explainers…")
 
 # Models and explainers were originally saved with joblib, so we must
-# load them the same way here.
-model_weeks = joblib.load(MODEL_DELAY)
-model_cost = joblib.load(MODEL_COST)
+# load them the same way here. If they are missing in the container,
+# the safe loader will return None and downstream code will fall back
+# to dummy predictions instead of crashing.
 
-expl_weeks = joblib.load(EXPLAINER_DELAY)
-expl_cost = joblib.load(EXPLAINER_COST)
+model_weeks = _safe_load_joblib(MODEL_DELAY, "MODEL_DELAY (weeks_late)")
+model_cost = _safe_load_joblib(MODEL_COST, "MODEL_COST (overrun_percent)")
+
+expl_weeks = _safe_load_joblib(EXPLAINER_DELAY, "EXPLAINER_DELAY (weeks_late)")
+expl_cost = _safe_load_joblib(EXPLAINER_COST, "EXPLAINER_COST (overrun_percent)")
+
 
 # ============================================================================
 # FEATURE ENGINEERING – MUST MATCH YOUR TRAINING DATA
@@ -257,13 +288,18 @@ def _safe_float(x: object, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+
 def predict_xgb(df_features: pd.DataFrame):
     """Predict using XGBoost for weeks_late and cost_overrun_percent.
 
     df_features must already contain FEATURE_COLS.
     """
 
-    if df_features.empty:
+    # If we have no features or no models loaded (e.g. missing .pkl files
+    # in the cloud container), fall back to zeros instead of crashing.
+    if df_features.empty or model_weeks is None or model_cost is None:
+        print("[ml_core] predict_xgb: models not available or no features; "
+              "returning zeros.")
         return 0.0, 0.0
 
     df_input = df_features[FEATURE_COLS]
@@ -281,7 +317,9 @@ def predict_xgb(df_features: pd.DataFrame):
 def explain_xgb(df_features: pd.DataFrame):
     """SHAP values for LLM explanations (using original FEATURE_COLS)."""
 
-    if df_features.empty:
+    if df_features.empty or expl_weeks is None or expl_cost is None:
+        print("[ml_core] explain_xgb: explainers not available or no features; "
+              "returning zero SHAP values.")
         return np.zeros(len(FEATURE_COLS)), np.zeros(len(FEATURE_COLS))
 
     df_input = df_features[FEATURE_COLS]
