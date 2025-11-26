@@ -1,0 +1,43 @@
+# --- Python virtual envs ---
+.venv/
+venv/
+
+# --- Python cache / compiled files ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# --- Environment files ---
+.env
+.env.*
+
+# --- Editor / IDE files ---
+.vscode/
+.idea/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Data files (adjust as needed) ---
+data/
+*.csv
+*.xlsx
+
+# --- Model artifacts / checkpoints ---
+checkpoints/
+runs/
+models/
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# --- Build artifacts ---
+dist/
+build/
+*.egg-info/
