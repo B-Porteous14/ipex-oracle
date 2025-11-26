@@ -1,17 +1,3 @@
-"""
-ml_core.py
-
-Production ML core for IPEX Oracle.
-
-- Loads XGBoost delay & cost models (and SHAP explainers) from .pkl files.
-- Aligns incoming features to the model's expected feature set.
-- Avoids XGBoost "feature_names mismatch" errors by passing NumPy arrays.
-- Gracefully degrades to zeros if any artefacts are missing.
-
-Transformer / GNN models are optional and currently return None so the
-API fields appear as `null` in JSON. You can wire these in later.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -23,19 +9,22 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from training_model.transformer_head import (
+    predict_transformer_from_df,
+    TRANSFORMER_AVAILABLE,
+)
+
 logger = logging.getLogger("ml_core")
 if not logger.handlers:
-    # Basic console logging; Railway will capture stdout.
     handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "[ml_core] %(levelname)s: %(message)s"
-    )
+    formatter = logging.Formatter("[ml_core] %(levelname)s: %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+
 # ---------------------------------------------------------------------------
-# Paths to artefacts
+# Paths and artefact loading
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,14 +35,6 @@ MODEL_COST_PATH = BASE_DIR / "model_overrun_percent.pkl"
 EXPLAINER_DELAY_PATH = BASE_DIR / "explainer_weeks_late.pkl"
 EXPLAINER_COST_PATH = BASE_DIR / "explainer_overrun_percent.pkl"
 
-# Optional transformer artefacts (only used if you later wire them in)
-TRANSFORMER_MODEL_PATH = BASE_DIR / "transformer_model.pt"
-TRANSFORMER_NORM_STATS_PATH = BASE_DIR / "transformer_norm_stats.npz"
-
-# ---------------------------------------------------------------------------
-# Safe loading helpers
-# ---------------------------------------------------------------------------
-
 
 def _load_joblib(path: Path, name: str) -> Optional[Any]:
     if not path.exists():
@@ -63,40 +44,31 @@ def _load_joblib(path: Path, name: str) -> Optional[Any]:
         obj = joblib.load(path)
         logger.info("Loaded %s from %s", name, path.name)
         return obj
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover
         logger.warning("Failed to load %s from %s: %s", name, path, exc)
         return None
 
 
 def _get_feature_names_from_model(model: Any) -> List[str]:
-    """
-    Try hard to discover the feature name list used when the XGBoost model
-    was trained. Different xgboost versions store this differently.
-    """
+    """Try hard to discover the feature name list used when the XGBoost model was trained."""
     if model is None:
         return []
 
-    # 1) Newer xgboost: model.feature_names_in_
     names = getattr(model, "feature_names_in_", None)
     if names is not None and len(names):
         return [str(c) for c in list(names)]
 
-    # 2) Access booster.feature_names
-    booster = getattr(model, "get_booster", None)
-    if booster is not None:
+    booster_fn = getattr(model, "get_booster", None)
+    if booster_fn is not None:
         try:
-            bst = booster()
-            if hasattr(bst, "feature_names") and bst.feature_names:
-                return [str(c) for c in list(bst.feature_names)]
+            booster = booster_fn()
+            if hasattr(booster, "feature_names") and booster.feature_names:
+                return [str(c) for c in list(booster.feature_names)]
         except Exception:
-            pass  # fall through
+            pass
 
     return []
 
-
-# ---------------------------------------------------------------------------
-# Load models / explainers at import time
-# ---------------------------------------------------------------------------
 
 model_weeks = _load_joblib(MODEL_DELAY_PATH, "delay model")
 model_cost = _load_joblib(MODEL_COST_PATH, "cost model")
@@ -112,22 +84,16 @@ if DELAY_FEATURES:
 if COST_FEATURES:
     logger.info("Cost model expects %d features.", len(COST_FEATURES))
 
-# Optional: lazy-loaded transformer model (if you wire it in later)
-_transformer_model: Any = None
-
 
 # ---------------------------------------------------------------------------
-# Feature preparation and alignment
+# Feature preparation
 # ---------------------------------------------------------------------------
-
 
 def _numericise_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert all columns to numeric where possible.
-
-    - For numeric dtypes we keep as-is.
-    - For object/string columns we strip non-numeric characters (to cope with
-      '$', commas, etc.) and coerce to float. Non-convertible values become NaN.
+    - Numeric dtypes are kept as float.
+    - Object/string columns have non-numeric chars stripped, then coerced.
     """
     out = pd.DataFrame(index=df.index)
 
@@ -136,7 +102,6 @@ def _numericise_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_numeric_dtype(s):
             out[col] = s.astype(float)
         else:
-            # Convert things like "$1,234.56" or "-$6,557.18" to numbers
             cleaned = (
                 s.astype(str)
                 .str.replace(r"[^0-9eE+\-\.]", "", regex=True)
@@ -144,7 +109,6 @@ def _numericise_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             )
             out[col] = pd.to_numeric(cleaned, errors="coerce")
 
-    # Replace remaining NaNs with 0 – the models were trained on numeric data
     out = out.fillna(0.0)
     return out
 
@@ -156,13 +120,11 @@ def _align_features_for_model(
 ) -> pd.DataFrame:
     """
     Aligns the numeric dataframe to the model's expected feature set.
-
     - Missing features are added and filled with 0.
     - Extra features are dropped.
     - Returns a dataframe with columns in the exact expected order.
     """
     if not expected_cols:
-        # If we don't know the feature names, just pass everything through.
         logger.warning(
             "%s has no recorded feature_names; using all numeric columns: %s",
             model_label,
@@ -175,14 +137,14 @@ def _align_features_for_model(
 
     if missing:
         logger.warning(
-            "%s: input missing %d feature(s): %s – filling with 0.0",
+            "%s model: input missing %d feature(s): %s – filling with 0.0",
             model_label,
             len(missing),
             ", ".join(missing),
         )
     if extra:
         logger.info(
-            "%s: input has %d extra feature(s) that will be ignored: %s",
+            "%s model: input has %d extra feature(s) that will be ignored: %s",
             model_label,
             len(extra),
             ", ".join(extra[:25]) + ("..." if len(extra) > 25 else ""),
@@ -192,11 +154,6 @@ def _align_features_for_model(
     return df_aligned
 
 
-# ---------------------------------------------------------------------------
-# Core prediction helpers
-# ---------------------------------------------------------------------------
-
-
 def _predict_with_xgb(
     model: Any,
     df_numeric: pd.DataFrame,
@@ -204,23 +161,20 @@ def _predict_with_xgb(
     label: str,
 ) -> float:
     """
-    Predict using an XGBoost model, with robust handling of feature name
-    mismatches.
-
-    We **always** pass a NumPy array into model.predict(), which avoids
-    xgboost's feature_names consistency checks.
+    Predict using an XGBoost model, with robust handling of feature name mismatches.
+    We always pass a NumPy array into model.predict(), which avoids xgboost's
+    feature_names consistency checks.
     """
     if model is None:
         return 0.0
 
     try:
-        X = _align_features_for_model(df_numeric, expected_cols, f"{label} model")
-        # IMPORTANT: use .values so xgboost does not try to match column names
+        X = _align_features_for_model(df_numeric, expected_cols, label)
         y_pred = model.predict(X.values)
         if isinstance(y_pred, (list, np.ndarray, pd.Series)):
             return float(y_pred[0])
         return float(y_pred)
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover
         logger.warning("%s model predict failed: %s", label, exc)
         return 0.0
 
@@ -231,30 +185,25 @@ def _compute_shap_values(
     expected_cols: List[str],
     label: str,
 ) -> List[float]:
-    """
-    Compute SHAP values for a single row, if possible.
-    """
+    """Compute SHAP values for a single row, if possible."""
     if explainer is None:
         return []
 
     try:
         X = _align_features_for_model(df_numeric, expected_cols, f"{label} SHAP")
         sv = explainer.shap_values(X)
-        # sv might be shape (n_samples, n_features)
         if isinstance(sv, list):
             sv = sv[0]
         if isinstance(sv, np.ndarray):
             return sv[0].tolist()
         return []
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover
         logger.warning("%s SHAP failed: %s", label, exc)
         return []
 
 
 def _simple_explanation_text(weeks_late: float, cost_overrun_pct: float) -> str:
-    """
-    Lightweight, non-LLM explanation that always works (even without OpenAI).
-    """
+    """Very lightweight rule-based explanation."""
     if weeks_late <= 0.5 and abs(cost_overrun_pct) < 2:
         risk_level = "low risk"
     elif weeks_late <= 4 and cost_overrun_pct < 10:
@@ -262,29 +211,34 @@ def _simple_explanation_text(weeks_late: float, cost_overrun_pct: float) -> str:
     else:
         risk_level = "elevated risk"
 
+    direction_weeks = "late" if weeks_late >= 0 else "ahead of plan"
+    direction_cost = "over" if cost_overrun_pct >= 0 else "under"
+
     return (
         f"The project is currently assessed as {risk_level}. "
-        f"Schedule performance is forecast at roughly {weeks_late:.1f} weeks "
-        f"{'late' if weeks_late >= 0 else 'ahead of plan'}, while cost "
-        f"performance is forecast at about {cost_overrun_pct:.1f}% "
-        f"{'over' if cost_overrun_pct >= 0 else 'under'} the original budget."
+        f"Schedule performance is forecast at roughly {weeks_late:.1f} weeks {direction_weeks}, "
+        f"while cost performance is forecast at about {cost_overrun_pct:.1f}% {direction_cost} the original budget."
     )
 
 
-# ---------------------------------------------------------------------------
-# Public API functions
-# ---------------------------------------------------------------------------
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
     """
     Main entry point used by FastAPI.
 
-    df_project: dataframe containing data for a **single project**.
+    df_project: dataframe containing data for a single project.
                 It can be raw transactions or pre-aggregated features.
-                Any numeric columns will be used for modelling.
     """
-
     if df_project is None or df_project.empty:
         return {
             "project_id": "unknown",
@@ -309,8 +263,7 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
             "source_id": None,
         }
 
-    # Try to get a project_id if one exists
-    project_id = None
+    project_id = "unknown"
     for candidate in ["project_id", "ProjectID", "project"]:
         if candidate in df_project.columns:
             try:
@@ -318,45 +271,56 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
                 break
             except Exception:
                 pass
-    if project_id is None:
-        project_id = "unknown"
 
-    # Prepare numeric features
+    # Numeric features for XGBoost
     df_numeric = _numericise_dataframe(df_project)
 
-    # --- XGBoost predictions -------------------------------------------------
-    xgb_weeks = _predict_with_xgb(
-        model_weeks, df_numeric, DELAY_FEATURES, label="delay"
-    )
-    xgb_cost_pct = _predict_with_xgb(
-        model_cost, df_numeric, COST_FEATURES, label="cost"
-    )
+    xgb_weeks = _predict_with_xgb(model_weeks, df_numeric, DELAY_FEATURES, "delay")
+    xgb_cost_pct = _predict_with_xgb(model_cost, df_numeric, COST_FEATURES, "cost")
 
-    shap_weeks = _compute_shap_values(
-        explainer_weeks, df_numeric, DELAY_FEATURES, label="delay"
-    )
-    shap_cost = _compute_shap_values(
-        explainer_cost, df_numeric, COST_FEATURES, label="cost"
-    )
+    shap_weeks = _compute_shap_values(explainer_weeks, df_numeric, DELAY_FEATURES, "delay")
+    shap_cost = _compute_shap_values(explainer_cost, df_numeric, COST_FEATURES, "cost")
 
-    # --- Transformer / GNN placeholders -------------------------------------
+    # -----------------------------------------------------------------------
+    # Transformer inference (uses raw df_project, not numericised)
+    # -----------------------------------------------------------------------
     transformer_weeks: Optional[float] = None
     transformer_cost_pct: Optional[float] = None
 
-    gnn_weeks: Optional[float] = None
-    gnn_cost_pct: Optional[float] = None
+    if TRANSFORMER_AVAILABLE:
+        try:
+            t_preds = predict_transformer_from_df(df_project, project_id)
+            if t_preds is not None:
+                transformer_weeks = _safe_float(t_preds.get("weeks_late", 0.0))
+                transformer_cost_pct = _safe_float(
+                    t_preds.get("cost_overrun_percent", 0.0)
+                )
+                logger.info(
+                    "Transformer used for project %s: weeks=%.2f, cost=%.2f",
+                    project_id,
+                    transformer_weeks,
+                    transformer_cost_pct,
+                )
+            else:
+                logger.info(
+                    "Transformer skipped for project %s (no usable timeseries)",
+                    project_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Transformer inference failed for project %s: %s",
+                project_id,
+                exc,
+            )
+    else:
+        logger.info("Transformer not available; outputs will be null.")
 
-    # You can wire in real models later; for now we just log that they're null.
-    if not TRANSFORMER_MODEL_PATH.exists():
-        logger.info("Transformer model file not found; transformer outputs will be null.")
-    if gnn_weeks is None and gnn_cost_pct is None:
-        logger.info("GNN models not configured; GNN outputs will be null.")
-
-    # --- Blended scores (for now just equal to XGBoost) ---------------------
+    # -----------------------------------------------------------------------
+    # Blended metrics – for now just equal to XGBoost; can be changed later
+    # -----------------------------------------------------------------------
     blended_weeks = xgb_weeks
     blended_cost_pct = xgb_cost_pct
 
-    # --- Simple explanation & recommendations -------------------------------
     explanation = _simple_explanation_text(blended_weeks, blended_cost_pct)
 
     recommended_actions: List[str] = []
@@ -373,11 +337,10 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
             "Engage the project team to validate these risk signals and agree on a mitigation plan."
         )
 
-    # We are not actually calling OpenAI here, so we mark the LLM as unused.
+    # LLM not yet called here – main.py/llm_layer can upgrade this later.
     llm_used = False
     llm_error = "OPENAI_API_KEY environment variable is not set."
 
-    # Try to infer a source_id if csv filename was known upstream; otherwise use project_id.
     source_id = os.environ.get("CURRENT_SOURCE_ID", f"{project_id}.csv")
 
     return {
@@ -391,14 +354,14 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
             "xgb_cost_overrun_percent": float(xgb_cost_pct),
             "transformer_weeks_late": transformer_weeks,
             "transformer_cost_overrun_percent": transformer_cost_pct,
-            "gnn_weeks_late": gnn_weeks,
-            "gnn_cost_overrun_percent": gnn_cost_pct,
+            "gnn_weeks_late": None,
+            "gnn_cost_overrun_percent": None,
         },
         "shap": {
             "weeks_late": shap_weeks,
             "cost_overrun_percent": shap_cost,
         },
-        "trade_risks": [],  # placeholder for future per-trade risk flags
+        "trade_risks": [],
         "explanation_text": explanation,
         "recommended_actions": recommended_actions,
         "llm_used": llm_used,
@@ -409,8 +372,8 @@ def make_risk_summary_from_df(df_project: pd.DataFrame) -> Dict[str, Any]:
 
 def batch_predict(df_all: pd.DataFrame) -> List[Dict[str, Any]]:
     """
-    Batch version used by CLI tools / tests: group by project_id (if present)
-    and run make_risk_summary_from_df for each group.
+    Batch version: group by project_id (if present) and run
+    make_risk_summary_from_df for each group.
     """
     outputs: List[Dict[str, Any]] = []
 
@@ -418,7 +381,6 @@ def batch_predict(df_all: pd.DataFrame) -> List[Dict[str, Any]]:
         return outputs
 
     if "project_id" not in df_all.columns:
-        # Treat entire dataframe as one project
         outputs.append(make_risk_summary_from_df(df_all))
         return outputs
 
