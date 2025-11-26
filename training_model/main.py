@@ -12,6 +12,7 @@
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from pathlib import Path
 import pandas as pd
 
@@ -27,6 +28,15 @@ from training_model.llm_layer import generate_oracle_explanation
 # ---------------------------------------------------------------
 
 app = FastAPI(title="IPEX Oracle API", version="3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # for now; later lock this to your Vercel domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app.add_middleware(
     CORSMiddleware,
