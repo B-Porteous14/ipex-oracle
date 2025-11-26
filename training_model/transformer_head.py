@@ -7,16 +7,13 @@ trained Transformer saved in:
     training_model/transformer_model.pt
     training_model/transformer_norm_stats.npz
 
-This module exposes:
+Exposes:
 
     - TRANSFORMER_AVAILABLE: bool
-    - parse_money(value) -> float | numpy.nan
     - predict_transformer_from_df(df_project, project_id) -> Optional[Dict[str, float]]
 
-ml_core imports these and will:
-
-    * Skip Transformer if TRANSFORMER_AVAILABLE is False
-    * Log and continue if predict_transformer_from_df() returns None / raises
+This version is very verbose in its logging so that we can see what is
+happening in Railway logs.
 """
 
 from __future__ import annotations
@@ -29,14 +26,13 @@ import pandas as pd
 
 # Torch is optional: Railway has it, but local tools might not.
 try:
-    import torch
-    from torch import nn  # noqa: F401  # for type hints / saved models
+    import torch  # type: ignore
+    from torch import nn  # noqa: F401
 
     _TORCH_OK = True
-except Exception:  # pragma: no cover
+except Exception:
     torch = None  # type: ignore
     _TORCH_OK = False
-
 
 # ---------------------------------------------------------------------
 # Globals – populated by _load_transformer()
@@ -50,12 +46,16 @@ _FEATURE_COLS: Optional[np.ndarray] = None
 _TARGET_COLS: Optional[np.ndarray] = None
 
 
+def _log(msg: str) -> None:
+    # Simple print-based logging so it always appears in Railway logs
+    print(f"[transformer_head] {msg}", flush=True)
+
+
 def parse_money(value) -> float:
     """
     Parse money-like strings into floats.
 
-    Mirrors the helper in train_models.py so behaviour is consistent.
-    Examples of accepted values:
+    Examples accepted:
         "$1,234.50", "-$6,557.18", "  1234  ", 1234.0, None
 
     Returns np.nan for unparseable values.
@@ -84,8 +84,7 @@ def _load_transformer() -> None:
     """
     Load the Transformer model and normalisation stats.
 
-    This is called lazily the first time you run prediction, but we also
-    attempt to call it at import time so failures appear clearly in logs.
+    Called at import time and on first prediction.
     """
     global TRANSFORMER_AVAILABLE, _MODEL, _NORM_STATS, _FEATURE_COLS, _TARGET_COLS
 
@@ -93,7 +92,7 @@ def _load_transformer() -> None:
         return
 
     if not _TORCH_OK:
-        print("[transformer_head] torch not available – Transformer disabled.")
+        _log("torch not available – Transformer disabled.")
         TRANSFORMER_AVAILABLE = False
         return
 
@@ -102,20 +101,20 @@ def _load_transformer() -> None:
     stats_path = base / "transformer_norm_stats.npz"
 
     if not model_path.exists() or not stats_path.exists():
-        print(
-            f"[transformer_head] Missing Transformer artefacts at {model_path} / {stats_path}; "
+        _log(
+            f"Missing artefacts at {model_path} / {stats_path} – "
             "Transformer predictions will be disabled."
         )
         TRANSFORMER_AVAILABLE = False
         return
 
     try:
-        print(f"[transformer_head] Loading Transformer model from {model_path.name}...")
+        _log(f"Loading Transformer model from {model_path} ...")
         _MODEL = torch.load(model_path, map_location="cpu")
         if hasattr(_MODEL, "eval"):
             _MODEL.eval()
 
-        print(f"[transformer_head] Loading Transformer normalisation stats from {stats_path.name}...")
+        _log(f"Loading normalisation stats from {stats_path} ...")
         stats = np.load(stats_path, allow_pickle=True)
         _NORM_STATS = {
             "mean": stats["mean"],
@@ -126,13 +125,13 @@ def _load_transformer() -> None:
         _FEATURE_COLS = stats["feature_cols"]
         _TARGET_COLS = stats["target_cols"]
 
-        print(
-            f"[transformer_head] Loaded Transformer with {len(_FEATURE_COLS)} features: "
+        _log(
+            f"Loaded Transformer with {len(_FEATURE_COLS)} features: "
             f"{list(_FEATURE_COLS)} and targets {list(_TARGET_COLS)}"
         )
         TRANSFORMER_AVAILABLE = True
-    except Exception as exc:  # pragma: no cover
-        print(f"[transformer_head] ERROR loading Transformer: {exc}")
+    except Exception as exc:
+        _log(f"ERROR loading Transformer: {exc}")
         TRANSFORMER_AVAILABLE = False
         _MODEL = None
         _NORM_STATS = None
@@ -140,7 +139,7 @@ def _load_transformer() -> None:
         _TARGET_COLS = None
 
 
-# Try to load artefacts on import so we get early feedback
+# Try to load at import so startup logs show status
 _load_transformer()
 
 
@@ -148,12 +147,12 @@ _load_transformer()
 # Timeseries feature building
 # ---------------------------------------------------------------------
 
-def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarray]:
+def _build_timeseries_for_project(df_project: pd.DataFrame, project_id: str) -> Optional[np.ndarray]:
     """
     Build a [T, F] timeseries array for a single project, in the same
     feature order as used for training (from transformer_norm_stats.npz).
 
-    Features from stats file:
+    Expected features (from stats):
         ['t',
          'days_since_first_payment',
          'payment_amount',
@@ -163,10 +162,13 @@ def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarr
     """
 
     if _FEATURE_COLS is None:
-        print("[transformer_head] No feature_cols in norm stats; cannot build timeseries.")
+        _log("No feature_cols in norm stats; cannot build timeseries.")
         return None
 
-    # Work on a copy
+    if df_project is None or df_project.empty:
+        _log(f"Project {project_id}: empty df_project passed to Transformer.")
+        return None
+
     df = df_project.copy()
 
     # Parse money columns
@@ -185,7 +187,7 @@ def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarr
     df = df[~df["payment_amount_num"].isna()].copy()
 
     if df.empty:
-        print("[transformer_head] No valid payment rows for Transformer.")
+        _log(f"Project {project_id}: no valid payment rows for Transformer.")
         return None
 
     # Sort by payment date
@@ -200,7 +202,6 @@ def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarr
 
     project_value = df["project_value_num"].iloc[0]
     if not np.isfinite(project_value) or project_value <= 0:
-        # Try a fallback from original column
         pv_fallback = parse_money(df.get("project_value", [np.nan])[0])
         project_value = (
             pv_fallback if np.isfinite(pv_fallback) and pv_fallback > 0 else np.nan
@@ -219,9 +220,8 @@ def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarr
     for col in _FEATURE_COLS:
         col = str(col)
         if col not in df.columns:
-            # If a feature is completely missing, fill with zeros
-            print(
-                f"[transformer_head] Warning: missing feature column '{col}', "
+            _log(
+                f"Project {project_id}: missing feature column '{col}', "
                 "filling with 0."
             )
             features.append(np.zeros(len(df), dtype=float))
@@ -229,8 +229,8 @@ def _build_timeseries_for_project(df_project: pd.DataFrame) -> Optional[np.ndarr
             series = df[col].astype(float).fillna(0.0).to_numpy()
             features.append(series)
 
-    # Shape: [F, T] -> [T, F]
-    x = np.stack(features, axis=0).T
+    x = np.stack(features, axis=0).T  # [T, F]
+    _log(f"Project {project_id}: built timeseries with shape {x.shape}.")
     return x
 
 
@@ -252,17 +252,10 @@ def _normalise_features(x: np.ndarray) -> np.ndarray:
     mean = np.asarray(mean, dtype=float)
     std = np.asarray(std, dtype=float)
 
-    # Make sure shapes line up: [F] broadcast over [T, F]
-    if mean.shape[0] != x.shape[1]:
-        print(
-            "[transformer_head] Warning: mean shape does not match features; "
-            "skipping normalisation."
-        )
-        return x
-    if std.shape[0] != x.shape[1]:
-        print(
-            "[transformer_head] Warning: std shape does not match features; "
-            "skipping normalisation."
+    if mean.shape[0] != x.shape[1] or std.shape[0] != x.shape[1]:
+        _log(
+            f"Warning: mean/std shapes {mean.shape}/{std.shape} do not match "
+            f"features {x.shape}; skipping normalisation."
         )
         return x
 
@@ -281,47 +274,35 @@ def predict_transformer_from_df(
     """
     High-level helper used by ml_core.
 
-    Takes a per-project payments dataframe, builds the time-series features,
-    runs the Transformer, and returns a dict:
-
-        {
-            "weeks_late": float,
-            "cost_overrun_percent": float,
-        }
-
-    Returns None if Transformer is not available or if inference fails.
+    Returns:
+        {"weeks_late": float, "cost_overrun_percent": float}
+    or None if Transformer not available / fails.
     """
+    _load_transformer()
+
     if not TRANSFORMER_AVAILABLE or _MODEL is None:
+        _log(f"Project {project_id}: Transformer not available in predict()")
         return None
 
     try:
-        x = _build_timeseries_for_project(df_project)
+        x = _build_timeseries_for_project(df_project, project_id)
         if x is None or x.size == 0:
-            print(
-                f"[transformer_head] Project {project_id}: "
-                "no usable timeseries for Transformer."
-            )
+            _log(f"Project {project_id}: no usable timeseries for Transformer.")
             return None
 
-        x = _normalise_features(x)  # [T, F]
-        # Add batch dimension: [1, T, F]
-        x_batch = np.expand_dims(x, axis=0)
+        x = _normalise_features(x)
+        x_batch = np.expand_dims(x, axis=0)  # [1, T, F]
 
         x_tensor = torch.from_numpy(x_batch).float()
 
         with torch.no_grad():
             out = _MODEL(x_tensor)
 
-        # Try to interpret output
         out_np = out.detach().cpu().numpy()
 
-        # Common patterns:
-        #   [1, 2]        -> 2 targets
-        #   [1, T, 2]     -> sequence of 2-dim outputs, take last step
         if out_np.ndim == 2 and out_np.shape[0] == 1:
             vec = out_np[0]
         elif out_np.ndim == 3:
-            # Take last timestep
             vec = out_np[0, -1, :]
         else:
             vec = out_np.reshape(-1)
@@ -333,13 +314,10 @@ def predict_transformer_from_df(
             weeks_pred = float(vec[0])
             cost_pred = 0.0
         else:
-            print(
-                f"[transformer_head] Project {project_id}: "
-                "Transformer output empty."
-            )
+            _log(f"Project {project_id}: Transformer output empty.")
             return None
 
-        # Optionally un-normalise targets if they were trained in z-space
+        # Un-normalise targets if they were trained in z-space
         if (
             _NORM_STATS is not None
             and "target_mean" in _NORM_STATS
@@ -347,14 +325,13 @@ def predict_transformer_from_df(
         ):
             t_mean = np.asarray(_NORM_STATS["target_mean"], dtype=float)
             t_std = np.asarray(_NORM_STATS["target_std"], dtype=float)
-            # Expect shape [2]
-            if t_mean.shape[0] == 2 and t_std.shape[0] == 2:
+            if t_mean.shape[0] >= 2 and t_std.shape[0] >= 2:
                 weeks_pred = weeks_pred * t_std[0] + t_mean[0]
                 cost_pred = cost_pred * t_std[1] + t_mean[1]
 
-        print(
-            f"[transformer_head] Project {project_id}: "
-            f"Transformer weeks={weeks_pred:.2f}, cost={cost_pred:.2f}"
+        _log(
+            f"Project {project_id}: Transformer weeks={weeks_pred:.2f}, "
+            f"cost={cost_pred:.2f}"
         )
 
         return {
@@ -362,9 +339,8 @@ def predict_transformer_from_df(
             "cost_overrun_percent": float(cost_pred),
         }
 
-    except Exception as exc:  # pragma: no cover
-        print(
-            f"[transformer_head] ERROR during Transformer inference for project "
-            f"{project_id}: {exc}"
+    except Exception as exc:
+        _log(
+            f"ERROR during Transformer inference for project {project_id}: {exc}"
         )
         return None
